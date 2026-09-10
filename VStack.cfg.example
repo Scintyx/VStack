@@ -1,0 +1,11 @@
+## VStack configuration
+## Generated/used at: BepInEx/config/VStack.cfg
+## Restart V Rising / the server after editing this text file.
+
+[Stacks]
+
+## Inventory stack multiplier.
+## Default: 1000
+## Examples: 10, 100, 500, 1000, 5000
+## Valid positive range: 0.01 to 65504
+Multiplier = 1000
