@@ -49,13 +49,13 @@ jobs:
           zip -r "$GITHUB_WORKSPACE/dist/VStack_Thunderstore_v1.0.0.zip" .
 
       - name: Upload DLL artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VStack-dll
           path: src/VStack/bin/Release/net6.0/VStack.dll
 
       - name: Upload Thunderstore package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VStack-Thunderstore-v1.0.0
           path: dist/VStack_Thunderstore_v1.0.0.zip
