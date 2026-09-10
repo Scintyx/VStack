@@ -51,7 +51,7 @@ public sealed class Plugin : BasePlugin
     private bool _loggedInvalidConfig;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate ushort SettingsClampHalfDelegate(float value, float min, float max, nint fieldName);
+    private delegate ushort SettingsClampHalfDelegate(float value, float min, float max, IntPtr fieldName);
 
     public override void Load()
     {
@@ -67,8 +67,8 @@ public sealed class Plugin : BasePlugin
 
         try
         {
-            nint target = FindSettingsClampHalf();
-            if (target == nint.Zero)
+            IntPtr target = FindSettingsClampHalf();
+            if (target == IntPtr.Zero)
             {
                 Log.LogError("SettingsClamp::Half signature was not found. The game may have updated; no patch was applied.");
                 return;
@@ -109,7 +109,7 @@ public sealed class Plugin : BasePlugin
         return true;
     }
 
-    private ushort SettingsClampHalfDetour(float value, float min, float max, nint fieldName)
+    private ushort SettingsClampHalfDetour(float value, float min, float max, IntPtr fieldName)
     {
         SettingsClampHalfDelegate? original = _original;
         if (original is null)
@@ -163,9 +163,9 @@ public sealed class Plugin : BasePlugin
         return Math.Max(configured, MinimumMultiplier);
     }
 
-    private static unsafe bool IsIl2CppStringEqual(nint stringObject, string expected)
+    private static unsafe bool IsIl2CppStringEqual(IntPtr stringObject, string expected)
     {
-        if (stringObject == nint.Zero)
+        if (stringObject == IntPtr.Zero)
             return false;
 
         // 64-bit IL2CPP string layout:
@@ -187,7 +187,7 @@ public sealed class Plugin : BasePlugin
         return true;
     }
 
-    private unsafe nint FindSettingsClampHalf()
+    private unsafe IntPtr FindSettingsClampHalf()
     {
         ProcessModule? gameAssembly = null;
         foreach (ProcessModule module in Process.GetCurrentProcess().Modules)
@@ -215,7 +215,7 @@ public sealed class Plugin : BasePlugin
         ushort optionalHeaderSize = *(ushort*)(ntHeaders + 0x14);
         byte* section = ntHeaders + 0x18 + optionalHeaderSize;
 
-        nint found = nint.Zero;
+        IntPtr found = IntPtr.Zero;
         int matches = 0;
 
         for (int i = 0; i < numberOfSections; i++, section += 40)
@@ -236,12 +236,12 @@ public sealed class Plugin : BasePlugin
                     continue;
 
                 matches++;
-                found = (nint)(start + offset);
+                found = (IntPtr)(start + offset);
             }
         }
 
         if (matches == 0)
-            return nint.Zero;
+            return IntPtr.Zero;
 
         if (matches != 1)
             throw new InvalidOperationException($"SettingsClamp::Half signature was not unique ({matches} matches). Refusing to hook.");

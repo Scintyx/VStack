@@ -1,6 +1,7 @@
 # Changelog
 
 ## 1.0.0
+- Fixed GitHub Actions compile compatibility by using `System.IntPtr` instead of the native-integer `nint` alias for BepInEx native detour pointers.
 
 - Renamed the public project and package to **VStack**.
 - Managed-only BepInEx plugin; no custom native helper DLLs.
