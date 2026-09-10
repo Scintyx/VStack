@@ -1,0 +1,61 @@
+name: Build VStack
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Restore
+        run: dotnet restore src/VStack/VStack.csproj --configfile nuget.config
+
+      - name: Build
+        run: dotnet build src/VStack/VStack.csproj -c Release --no-restore
+
+      - name: Prepare Thunderstore package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$GITHUB_WORKSPACE/dist/VStack"
+          mkdir -p "$PKG/BepInEx/plugins/VStack" "$PKG/Source"
+
+          cp src/VStack/bin/Release/net6.0/VStack.dll "$PKG/BepInEx/plugins/VStack/VStack.dll"
+          cp src/VStack/Plugin.cs "$PKG/Source/Plugin.cs"
+          cp src/VStack/VStack.csproj "$PKG/Source/VStack.csproj"
+          printf '%s\n' "$GITHUB_SHA" > "$PKG/Source/BUILD_COMMIT.txt"
+          cp README.md CHANGELOG.md LICENSE ACKNOWLEDGEMENTS.md SOURCE_REVIEW.md VStack.cfg.example "$PKG/"
+          cp thunderstore/icon.png "$PKG/icon.png"
+
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          sed "s|__REPOSITORY_URL__|${REPO_URL}|g" thunderstore/manifest.template.json > "$PKG/manifest.json"
+
+          cd "$PKG"
+          zip -r "$GITHUB_WORKSPACE/dist/VStack_Thunderstore_v1.0.0.zip" .
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VStack-dll
+          path: src/VStack/bin/Release/net6.0/VStack.dll
+
+      - name: Upload Thunderstore package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VStack-Thunderstore-v1.0.0
+          path: dist/VStack_Thunderstore_v1.0.0.zip
