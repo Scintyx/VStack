@@ -79,7 +79,7 @@ jobs:
           cp src/VStack/VStack.csproj "$PKG/Source/VStack.csproj"
           printf '%s\n' "$GITHUB_SHA" > "$PKG/Source/BUILD_COMMIT.txt"
 
-          cp README.md CHANGELOG.md LICENSE ACKNOWLEDGEMENTS.md SOURCE_REVIEW.md VStack.cfg.example "$PKG/"
+          cp README.md CHANGELOG.md SOURCE_REVIEW.md "$PKG/"
           cp thunderstore/icon.png "$PKG/icon.png"
 
           sed \
@@ -102,8 +102,6 @@ jobs:
             "manifest.json"
             "README.md"
             "CHANGELOG.md"
-            "LICENSE"
-            "ACKNOWLEDGEMENTS.md"
             "SOURCE_REVIEW.md"
             "icon.png"
             "BepInEx/plugins/VStack/VStack.dll"
