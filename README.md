@@ -97,7 +97,7 @@ Start the game/server once to generate `BepInEx/config/VStack.cfg`.
 ## Build
 
 ```bash
-dotnet restore src/VStack/VStack.csproj
+dotnet restore src/VStack/VStack.csproj --configfile nuget.config
 dotnet build src/VStack/VStack.csproj -c Release --no-restore
 ```
 
