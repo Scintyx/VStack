@@ -26,7 +26,7 @@ jobs:
           dotnet-version: '6.0.x'
 
       - name: Restore
-        run: dotnet restore src/VStack/VStack.csproj
+        run: dotnet restore src/VStack/VStack.csproj --configfile nuget.config
 
       - name: Build
         run: dotnet build src/VStack/VStack.csproj -c Release --no-restore
