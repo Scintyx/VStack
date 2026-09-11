@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Threading;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
@@ -55,15 +54,15 @@ public sealed class Plugin : BasePlugin
         true, true
     };
 
-    // Instruction sequence inside the generated InventoryBuffer serializers.
-    // Current V Rising builds contain TWO generated implementations with the same
-    // InventoryBuffer payload layout. They differ only in one stack-local offset
-    // ([rsp+0x30] versus [rsp+0x38]). Both must be patched; the live player
-    // inventory can use the second implementation.
+    // Instruction sequences inside the generated InventoryBuffer serializers.
+    // Current supplied V Rising client/server builds contain THREE generated
+    // implementations of the same 24-byte InventoryBuffer payload. Two share one
+    // register-allocation shape (variant A), while the third uses a different
+    // register-allocation shape (variant B). All three carry the same 0x0FFF bounds
+    // for Amount and MaxAmountOverride and must be patched.
     //
-    // The first 0x0FFF immediate is loaded into r13d and then reused for both
-    // InventoryBuffer.Amount and InventoryBuffer.MaxAmountOverride serialization.
-    private static readonly byte[] InventorySerializerPattern =
+    // Variant A loads the shared 0x0FFF immediate into r13d.
+    private static readonly byte[] InventorySerializerPatternA =
     {
         0x44, 0x8B, 0x64, 0x24, 0x30,
         0x41, 0xBD, 0xFF, 0x0F, 0x00, 0x00,
@@ -78,11 +77,44 @@ public sealed class Plugin : BasePlugin
         0xF2, 0x0F, 0x10, 0x4F, 0x10
     };
 
-    private static readonly bool[] InventorySerializerPatternMask =
+    private static readonly bool[] InventorySerializerPatternAMask =
     {
         true, true, true, true, false, // 0x30 or 0x38 stack-local offset
         true, true, true, true, true, true,
         true, true, true, true,
+        true, true, true,
+        true, true,
+        false, false, false, false,
+        true, true,
+        true, true, true,
+        true, true, true,
+        true, true, true, true,
+        true, true, true, true, true
+    };
+
+    // Variant B is the third generated implementation. It has the same 24-byte
+    // InventoryBuffer element layout and the same two 4095-bounded fields, but uses
+    // a different register allocation (r12d instead of r13d).
+    private static readonly byte[] InventorySerializerPatternB =
+    {
+        0x44, 0x8B, 0x7C, 0x24, 0x30,
+        0x41, 0xBC, 0xFF, 0x0F, 0x00, 0x00,
+        0x8B, 0x45, 0x04,
+        0x41, 0x39, 0x06,
+        0x0F, 0x8E,
+        0x00, 0x00, 0x00, 0x00,
+        0x8B, 0x06,
+        0x41, 0x3B, 0xC4,
+        0x0F, 0x10, 0x06,
+        0x41, 0x0F, 0x4F, 0xC4,
+        0xF2, 0x0F, 0x10, 0x4E, 0x10
+    };
+
+    private static readonly bool[] InventorySerializerPatternBMask =
+    {
+        true, true, true, true, true,
+        true, true, true, true, true, true,
+        true, true, true,
         true, true, true,
         true, true,
         false, false, false, false,
@@ -124,48 +156,19 @@ public sealed class Plugin : BasePlugin
         false, false, false, false
     };
 
-    private const int ExpectedInventorySerializerImplementations = 2;
+    private const int ExpectedInventorySerializerVariantACount = 2;
+    private const int ExpectedInventorySerializerVariantBCount = 1;
+    private const int ExpectedInventorySerializerImplementations =
+        ExpectedInventorySerializerVariantACount + ExpectedInventorySerializerVariantBCount;
+
     private const int SerializerMaximumImmediateOffset = 7;
-    private const int SerializerWriterCallOffset = 0x4F;
     private const int DeserializerMaximumImmediateOffset = 11;
-    private const int DeserializerReaderCallOffset = 18;
-    private const int DeserializerSearchStartOffset = 0x900;
-    private const int DeserializerSearchLength = 0x300;
 
-    // Temporary diagnostic hook for ItemGridSelectionEntry.CreateInventorySlotData.
-    // The native value-type layout is 0x10 bytes earlier than the boxed metadata
-    // offsets previously observed in IL2CPP metadata:
-    //   InventoryBuffer.Amount           metadata 0x20 -> native +0x10
-    //   InventoryBuffer.MaxAmountOverride metadata 0x24 -> native +0x14
-    //   Data.Stacks                      metadata 0x44 -> native +0x34
-    //   Data.MaxStacks                   metadata 0x48 -> native +0x38
-    //
-    // This prologue is unique in the supplied client/server GameAssembly builds and
-    // lets the diagnostic build prove whether the live ECS amount is already capped
-    // before the UI receives it.
-    private static readonly byte[] CreateInventorySlotDataPattern =
-    {
-        0x44, 0x89, 0x44, 0x24, 0x18,
-        0x48, 0x89, 0x54, 0x24, 0x10,
-        0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
-        0x48, 0x8D, 0xAC, 0x24, 0xD8, 0xFB, 0xFF, 0xFF,
-        0x48, 0x81, 0xEC, 0x28, 0x05, 0x00, 0x00
-    };
-
-    private static readonly bool[] CreateInventorySlotDataPatternMask =
-    {
-        true, true, true, true, true,
-        true, true, true, true, true,
-        true, true, true, true, true, true, true, true, true, true,
-        true, true, true, true, true, true, true, true,
-        true, true, true, true, true, true, true
-    };
-
-    private const int InventoryBufferAmountNativeOffset = 0x10;
-    private const int InventoryBufferMaxAmountOverrideNativeOffset = 0x14;
-    private const int InventorySlotDataStacksNativeOffset = 0x34;
-    private const int InventorySlotDataMaxStacksNativeOffset = 0x38;
-    private const int DiagnosticTraceLimitPerStage = 40;
+    // The three generated implementations place their matching deserializers at
+    // different relative distances. This local window covers all three while still
+    // requiring exactly two matching 0x0FFF bounds per implementation.
+    private const int DeserializerSearchStartOffset = 0x400;
+    private const int DeserializerSearchLength = 0x1000;
 
     private ConfigFile? _vStackConfig;
     private ConfigEntry<float>? _multiplier;
@@ -176,44 +179,8 @@ public sealed class Plugin : BasePlugin
     private bool _loggedInvalidConfig;
     private readonly List<MemoryPatch> _inventoryWirePatches = new();
 
-    // Wire/UI diagnostic detours. These are intentionally read-only: they only log
-    // the values flowing through the already identified inventory paths.
-    private IntPtr _inventoryWriterTarget;
-    private IntPtr _inventoryReaderTarget;
-    private INativeDetour? _boundedWriterDetour;
-    private INativeDetour? _boundedReaderDetour;
-    private INativeDetour? _createInventorySlotDataDetour;
-    private BoundedIntWriterDelegate? _boundedWriterOriginal;
-    private BoundedIntReaderDelegate? _boundedReaderOriginal;
-    private CreateInventorySlotDataDelegate? _createInventorySlotDataOriginal;
-    private BoundedIntWriterDelegate? _boundedWriterDelegate;
-    private BoundedIntReaderDelegate? _boundedReaderDelegate;
-    private CreateInventorySlotDataDelegate? _createInventorySlotDataDelegate;
-    private int _wireWriteTraceCount;
-    private int _wireReadTraceCount;
-    private int _uiTraceCount;
-
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ushort SettingsClampHalfDelegate(float value, float min, float max, IntPtr fieldName);
-
-    // Generated bounded integer writer:
-    //   writer, min, max, value, MethodInfo* -> bits written
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate int BoundedIntWriterDelegate(IntPtr writer, int min, int max, int value, IntPtr methodInfo);
-
-    // Generated bounded integer reader:
-    //   reader, min, max, MethodInfo* -> reconstructed value
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate int BoundedIntReaderDelegate(IntPtr reader, int min, int max, IntPtr methodInfo);
-
-    // Large value-type return uses the hidden result buffer as RCX. The second
-    // argument (RDX) is the native InventoryBuffer element pointer.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate IntPtr CreateInventorySlotDataDelegate(
-        IntPtr resultBuffer,
-        IntPtr inventoryBuffer,
-        int arg3,
-        IntPtr arg4);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -269,70 +236,25 @@ public sealed class Plugin : BasePlugin
         // Fix the 4095/4096 visible-count limitation at its actual source: the
         // generated InventoryBuffer snapshot wire bounds. This remains managed-only;
         // no custom native DLL or external hooking library is used.
-        bool wirePatchInstalled = false;
         try
         {
             InstallInventoryWirePatch();
-            wirePatchInstalled = true;
             Log.LogInfo(
                 $"InventoryBuffer extended-count wire patch enabled (0..{ExtendedInventoryWireMaximum}). " +
                 "VStack must be installed on both the server and every connecting client.");
         }
         catch (Exception ex)
         {
-            try
-            {
-                RestoreInventoryWirePatch();
-            }
-            catch (Exception restoreEx)
-            {
-                Log.LogWarning($"Additional error while rolling back InventoryBuffer wire patch: {restoreEx}");
-            }
-
+            RestoreInventoryWirePatch();
             Log.LogError(
                 "Failed to install the InventoryBuffer extended-count wire patch. " +
                 "The stack multiplier hook can still work, but inventory counts above 4095 may remain visually capped. " +
                 $"Details: {ex}");
         }
-
-        if (wirePatchInstalled)
-        {
-            try
-            {
-                InstallInventoryDiagnostics();
-                Log.LogWarning(
-                    "VStack inventory-count diagnostic tracing is ENABLED for this test build. " +
-                    "Reproduce one >4095 stack, then send the new BepInEx log.");
-            }
-            catch (Exception ex)
-            {
-                try
-                {
-                    RemoveInventoryDiagnostics();
-                }
-                catch (Exception cleanupEx)
-                {
-                    Log.LogWarning($"Additional error while removing partial inventory diagnostics: {cleanupEx}");
-                }
-
-                Log.LogError(
-                    "Inventory wire patch is active, but diagnostic tracing could not be installed. " +
-                    $"Details: {ex}");
-            }
-        }
     }
 
     public override bool Unload()
     {
-        try
-        {
-            RemoveInventoryDiagnostics();
-        }
-        catch (Exception ex)
-        {
-            Log.LogWarning($"Error while removing inventory diagnostic detours: {ex}");
-        }
-
         try
         {
             RestoreInventoryWirePatch();
@@ -442,21 +364,44 @@ public sealed class Plugin : BasePlugin
         if (_inventoryWirePatches.Count != 0)
             return;
 
-        List<IntPtr> serializerAnchors = FindExecutablePatternMatches(
-            InventorySerializerPattern,
-            InventorySerializerPatternMask);
+        List<IntPtr> serializerAnchorsA = FindExecutablePatternMatches(
+            InventorySerializerPatternA,
+            InventorySerializerPatternAMask);
 
-        if (serializerAnchors.Count != ExpectedInventorySerializerImplementations)
+        List<IntPtr> serializerAnchorsB = FindExecutablePatternMatches(
+            InventorySerializerPatternB,
+            InventorySerializerPatternBMask);
+
+        if (serializerAnchorsA.Count != ExpectedInventorySerializerVariantACount)
         {
             throw new InvalidOperationException(
-                $"Expected exactly {ExpectedInventorySerializerImplementations} InventoryBuffer serializer implementations, " +
-                $"found {serializerAnchors.Count}. Refusing to patch.");
+                $"Expected exactly {ExpectedInventorySerializerVariantACount} InventoryBuffer serializer variant-A implementations, " +
+                $"found {serializerAnchorsA.Count}. Refusing to patch.");
+        }
+
+        if (serializerAnchorsB.Count != ExpectedInventorySerializerVariantBCount)
+        {
+            throw new InvalidOperationException(
+                $"Expected exactly {ExpectedInventorySerializerVariantBCount} InventoryBuffer serializer variant-B implementation, " +
+                $"found {serializerAnchorsB.Count}. Refusing to patch.");
+        }
+
+        var serializerAnchors = new List<IntPtr>(ExpectedInventorySerializerImplementations);
+        serializerAnchors.AddRange(serializerAnchorsA);
+        serializerAnchors.AddRange(serializerAnchorsB);
+
+        var uniqueSerializerAnchors = new HashSet<IntPtr>();
+        foreach (IntPtr anchor in serializerAnchors)
+        {
+            if (!uniqueSerializerAnchors.Add(anchor))
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate InventoryBuffer serializer anchor 0x{anchor.ToInt64():X} detected. Refusing to patch.");
+            }
         }
 
         serializerAnchors.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
         var candidates = new List<MemoryPatch>(ExpectedInventorySerializerImplementations * 3);
-        var writerTargets = new HashSet<IntPtr>();
-        var readerTargets = new HashSet<IntPtr>();
 
         for (int implementationIndex = 0; implementationIndex < serializerAnchors.Count; implementationIndex++)
         {
@@ -464,9 +409,6 @@ public sealed class Plugin : BasePlugin
             int displayIndex = implementationIndex + 1;
 
             IntPtr serializerMaximum = IntPtr.Add(serializerAnchor, SerializerMaximumImmediateOffset);
-            IntPtr writerCall = IntPtr.Add(serializerAnchor, SerializerWriterCallOffset);
-            writerTargets.Add(ResolveRelativeCallTarget(writerCall, $"InventoryBuffer serializer #{displayIndex} bounded writer"));
-
             IntPtr deserializerSearchStart = IntPtr.Add(serializerAnchor, DeserializerSearchStartOffset);
             List<IntPtr> deserializerSites = FindPatternMatchesInRange(
                 deserializerSearchStart,
@@ -482,12 +424,6 @@ public sealed class Plugin : BasePlugin
             }
 
             deserializerSites.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
-
-            foreach (IntPtr deserializerSite in deserializerSites)
-            {
-                IntPtr readerCall = IntPtr.Add(deserializerSite, DeserializerReaderCallOffset);
-                readerTargets.Add(ResolveRelativeCallTarget(readerCall, $"InventoryBuffer deserializer #{displayIndex} bounded reader"));
-            }
 
             candidates.Add(new MemoryPatch(
                 serializerMaximum,
@@ -526,23 +462,6 @@ public sealed class Plugin : BasePlugin
             }
         }
 
-        if (writerTargets.Count != 1)
-        {
-            throw new InvalidOperationException(
-                $"Expected all InventoryBuffer serializers to share one bounded writer target; found {writerTargets.Count}. Refusing diagnostics.");
-        }
-
-        if (readerTargets.Count != 1)
-        {
-            throw new InvalidOperationException(
-                $"Expected all InventoryBuffer deserializers to share one bounded reader target; found {readerTargets.Count}. Refusing diagnostics.");
-        }
-
-        foreach (IntPtr target in writerTargets)
-            _inventoryWriterTarget = target;
-        foreach (IntPtr target in readerTargets)
-            _inventoryReaderTarget = target;
-
         // Record all validated targets before the first write so recovery can restore
         // even a write that succeeds but then fails during cache/protection handling.
         _inventoryWirePatches.AddRange(candidates);
@@ -566,168 +485,6 @@ public sealed class Plugin : BasePlugin
             RestoreInventoryWirePatch();
             throw;
         }
-    }
-
-    private void InstallInventoryDiagnostics()
-    {
-        RemoveInventoryDiagnostics();
-        _wireWriteTraceCount = 0;
-        _wireReadTraceCount = 0;
-        _uiTraceCount = 0;
-
-        if (_inventoryWriterTarget == IntPtr.Zero || _inventoryReaderTarget == IntPtr.Zero)
-            throw new InvalidOperationException("Inventory wire diagnostic targets were not resolved.");
-
-        BoundedIntWriterDelegate writerDelegate = BoundedIntWriterDetour;
-        _boundedWriterDelegate = writerDelegate;
-        _boundedWriterDetour = INativeDetour.CreateAndApply<BoundedIntWriterDelegate>(
-            _inventoryWriterTarget,
-            writerDelegate,
-            out var writerOriginal);
-        _boundedWriterOriginal = writerOriginal;
-        Log.LogInfo($"Diagnostic hook: bounded InventoryBuffer writer at 0x{_inventoryWriterTarget.ToInt64():X}.");
-
-        BoundedIntReaderDelegate readerDelegate = BoundedIntReaderDetour;
-        _boundedReaderDelegate = readerDelegate;
-        _boundedReaderDetour = INativeDetour.CreateAndApply<BoundedIntReaderDelegate>(
-            _inventoryReaderTarget,
-            readerDelegate,
-            out var readerOriginal);
-        _boundedReaderOriginal = readerOriginal;
-        Log.LogInfo($"Diagnostic hook: bounded InventoryBuffer reader at 0x{_inventoryReaderTarget.ToInt64():X}.");
-
-        List<IntPtr> uiMatches = FindExecutablePatternMatches(
-            CreateInventorySlotDataPattern,
-            CreateInventorySlotDataPatternMask);
-
-        if (uiMatches.Count == 1)
-        {
-            IntPtr uiTarget = uiMatches[0];
-            CreateInventorySlotDataDelegate uiDelegate = CreateInventorySlotDataDetour;
-            _createInventorySlotDataDelegate = uiDelegate;
-            _createInventorySlotDataDetour = INativeDetour.CreateAndApply<CreateInventorySlotDataDelegate>(
-                uiTarget,
-                uiDelegate,
-                out var uiOriginal);
-            _createInventorySlotDataOriginal = uiOriginal;
-            Log.LogInfo($"Diagnostic hook: ItemGridSelectionEntry.CreateInventorySlotData at 0x{uiTarget.ToInt64():X}.");
-        }
-        else
-        {
-            Log.LogWarning(
-                $"Diagnostic UI hook not installed: CreateInventorySlotData signature had {uiMatches.Count} matches. " +
-                "Wire tracing remains active.");
-        }
-    }
-
-    private void RemoveInventoryDiagnostics()
-    {
-        _createInventorySlotDataDetour?.Dispose();
-        _createInventorySlotDataDetour = null;
-        _createInventorySlotDataOriginal = null;
-        _createInventorySlotDataDelegate = null;
-
-        _boundedReaderDetour?.Dispose();
-        _boundedReaderDetour = null;
-        _boundedReaderOriginal = null;
-        _boundedReaderDelegate = null;
-
-        _boundedWriterDetour?.Dispose();
-        _boundedWriterDetour = null;
-        _boundedWriterOriginal = null;
-        _boundedWriterDelegate = null;
-    }
-
-    private int BoundedIntWriterDetour(IntPtr writer, int min, int max, int value, IntPtr methodInfo)
-    {
-        BoundedIntWriterDelegate? original = _boundedWriterOriginal;
-        if (original is null)
-            return 0;
-
-        int result = original(writer, min, max, value, methodInfo);
-
-        // The inventory calls patched by VStack are now min=0/max=Int32.MaxValue.
-        // Log the threshold itself as well as values above it so we can distinguish
-        // "already capped before serialization" from "true extended value reached the writer".
-        if (min == 0 && max == ExtendedInventoryWireMaximum && value >= VanillaInventoryWireMaximum)
-        {
-            int traceNumber = Interlocked.Increment(ref _wireWriteTraceCount);
-            if (traceNumber <= DiagnosticTraceLimitPerStage)
-            {
-                Log.LogWarning(
-                    $"VSTACK-DIAG WIRE-WRITE #{traceNumber}: value={value}, min={min}, max={max}, bits={result}.");
-            }
-        }
-
-        return result;
-    }
-
-    private int BoundedIntReaderDetour(IntPtr reader, int min, int max, IntPtr methodInfo)
-    {
-        BoundedIntReaderDelegate? original = _boundedReaderOriginal;
-        if (original is null)
-            return 0;
-
-        int value = original(reader, min, max, methodInfo);
-
-        if (min == 0 && max == ExtendedInventoryWireMaximum && value >= VanillaInventoryWireMaximum)
-        {
-            int traceNumber = Interlocked.Increment(ref _wireReadTraceCount);
-            if (traceNumber <= DiagnosticTraceLimitPerStage)
-            {
-                Log.LogWarning(
-                    $"VSTACK-DIAG WIRE-READ #{traceNumber}: value={value}, min={min}, max={max}.");
-            }
-        }
-
-        return value;
-    }
-
-    private IntPtr CreateInventorySlotDataDetour(
-        IntPtr resultBuffer,
-        IntPtr inventoryBuffer,
-        int arg3,
-        IntPtr arg4)
-    {
-        CreateInventorySlotDataDelegate? original = _createInventorySlotDataOriginal;
-        if (original is null)
-            return resultBuffer;
-
-        IntPtr returned = original(resultBuffer, inventoryBuffer, arg3, arg4);
-        IntPtr data = returned != IntPtr.Zero ? returned : resultBuffer;
-
-        if (inventoryBuffer == IntPtr.Zero || data == IntPtr.Zero)
-            return returned;
-
-        int amount = Marshal.ReadInt32(inventoryBuffer, InventoryBufferAmountNativeOffset);
-        int maxAmountOverride = Marshal.ReadInt32(inventoryBuffer, InventoryBufferMaxAmountOverrideNativeOffset);
-        int stacks = Marshal.ReadInt32(data, InventorySlotDataStacksNativeOffset);
-        int maxStacks = Marshal.ReadInt32(data, InventorySlotDataMaxStacksNativeOffset);
-
-        if (amount >= VanillaInventoryWireMaximum || stacks >= VanillaInventoryWireMaximum)
-        {
-            int traceNumber = Interlocked.Increment(ref _uiTraceCount);
-            if (traceNumber <= DiagnosticTraceLimitPerStage)
-            {
-                Log.LogWarning(
-                    $"VSTACK-DIAG UI #{traceNumber}: InventoryBuffer.Amount={amount}, " +
-                    $"MaxAmountOverride={maxAmountOverride}, Data.Stacks={stacks}, Data.MaxStacks={maxStacks}, arg3={arg3}.");
-            }
-        }
-
-        return returned;
-    }
-
-    private static IntPtr ResolveRelativeCallTarget(IntPtr callAddress, string description)
-    {
-        if (Marshal.ReadByte(callAddress) != 0xE8)
-        {
-            throw new InvalidOperationException(
-                $"Expected CALL rel32 for {description} at 0x{callAddress.ToInt64():X}. Refusing to continue.");
-        }
-
-        int displacement = Marshal.ReadInt32(callAddress, 1);
-        return new IntPtr(callAddress.ToInt64() + 5L + displacement);
     }
 
     private void RestoreInventoryWirePatch()
