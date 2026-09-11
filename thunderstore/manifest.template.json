@@ -1,8 +1,8 @@
 {
   "name": "VStack",
-  "version_number": "1.0.0",
+  "version_number": "__VERSION__",
   "website_url": "__REPOSITORY_URL__",
-  "description": "Open-source managed-only BepInEx stack multiplier mod for V Rising. Fully configurable; defaults to x1000.",
+  "description": "Managed-only V Rising stack multiplier mod. Defaults to x1000, configurable through VStack.cfg, with extended inventory counts beyond 4095.",
   "dependencies": [
     "BepInEx-BepInExPack_V_Rising-1.733.2"
   ]
