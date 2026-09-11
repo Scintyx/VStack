@@ -54,7 +54,12 @@ public sealed class Plugin : BasePlugin
         true, true
     };
 
-    // Unique instruction sequence inside the generated InventoryBuffer serializer.
+    // Instruction sequence inside the generated InventoryBuffer serializers.
+    // Current V Rising builds contain TWO generated implementations with the same
+    // InventoryBuffer payload layout. They differ only in one stack-local offset
+    // ([rsp+0x30] versus [rsp+0x38]). Both must be patched; the live player
+    // inventory can use the second implementation.
+    //
     // The first 0x0FFF immediate is loaded into r13d and then reused for both
     // InventoryBuffer.Amount and InventoryBuffer.MaxAmountOverride serialization.
     private static readonly byte[] InventorySerializerPattern =
@@ -74,7 +79,7 @@ public sealed class Plugin : BasePlugin
 
     private static readonly bool[] InventorySerializerPatternMask =
     {
-        true, true, true, true, true,
+        true, true, true, true, false, // 0x30 or 0x38 stack-local offset
         true, true, true, true, true, true,
         true, true, true, true,
         true, true, true,
@@ -118,6 +123,7 @@ public sealed class Plugin : BasePlugin
         false, false, false, false
     };
 
+    private const int ExpectedInventorySerializerImplementations = 2;
     private const int SerializerMaximumImmediateOffset = 7;
     private const int DeserializerMaximumImmediateOffset = 11;
     private const int DeserializerSearchStartOffset = 0x900;
@@ -317,40 +323,70 @@ public sealed class Plugin : BasePlugin
         if (_inventoryWirePatches.Count != 0)
             return;
 
-        IntPtr serializerAnchor = FindUniqueExecutablePattern(
+        List<IntPtr> serializerAnchors = FindExecutablePatternMatches(
             InventorySerializerPattern,
-            InventorySerializerPatternMask,
-            "InventoryBuffer serializer");
+            InventorySerializerPatternMask);
 
-        if (serializerAnchor == IntPtr.Zero)
-            throw new InvalidOperationException("InventoryBuffer serializer signature was not found.");
-
-        IntPtr serializerMaximum = IntPtr.Add(serializerAnchor, SerializerMaximumImmediateOffset);
-
-        IntPtr deserializerSearchStart = IntPtr.Add(serializerAnchor, DeserializerSearchStartOffset);
-        List<IntPtr> deserializerSites = FindPatternMatchesInRange(
-            deserializerSearchStart,
-            DeserializerSearchLength,
-            InventoryDeserializerBoundPattern,
-            InventoryDeserializerBoundPatternMask);
-
-        if (deserializerSites.Count != 2)
+        if (serializerAnchors.Count != ExpectedInventorySerializerImplementations)
         {
             throw new InvalidOperationException(
-                $"Expected exactly 2 InventoryBuffer deserializer bound sites, found {deserializerSites.Count}. Refusing to patch.");
+                $"Expected exactly {ExpectedInventorySerializerImplementations} InventoryBuffer serializer implementations, " +
+                $"found {serializerAnchors.Count}. Refusing to patch.");
         }
 
-        deserializerSites.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
+        serializerAnchors.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
+        var candidates = new List<MemoryPatch>(ExpectedInventorySerializerImplementations * 3);
 
-        var candidates = new List<MemoryPatch>
+        for (int implementationIndex = 0; implementationIndex < serializerAnchors.Count; implementationIndex++)
         {
-            new(serializerMaximum, VanillaInventoryWireMaximum, ExtendedInventoryWireMaximum, "serializer shared Amount/MaxAmountOverride bound"),
-            new(IntPtr.Add(deserializerSites[0], DeserializerMaximumImmediateOffset), VanillaInventoryWireMaximum, ExtendedInventoryWireMaximum, "deserializer Amount bound"),
-            new(IntPtr.Add(deserializerSites[1], DeserializerMaximumImmediateOffset), VanillaInventoryWireMaximum, ExtendedInventoryWireMaximum, "deserializer MaxAmountOverride bound")
-        };
+            IntPtr serializerAnchor = serializerAnchors[implementationIndex];
+            int displayIndex = implementationIndex + 1;
 
+            IntPtr serializerMaximum = IntPtr.Add(serializerAnchor, SerializerMaximumImmediateOffset);
+            IntPtr deserializerSearchStart = IntPtr.Add(serializerAnchor, DeserializerSearchStartOffset);
+            List<IntPtr> deserializerSites = FindPatternMatchesInRange(
+                deserializerSearchStart,
+                DeserializerSearchLength,
+                InventoryDeserializerBoundPattern,
+                InventoryDeserializerBoundPatternMask);
+
+            if (deserializerSites.Count != 2)
+            {
+                throw new InvalidOperationException(
+                    $"InventoryBuffer implementation #{displayIndex}: expected exactly 2 deserializer bound sites, " +
+                    $"found {deserializerSites.Count}. Refusing to patch.");
+            }
+
+            deserializerSites.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
+
+            candidates.Add(new MemoryPatch(
+                serializerMaximum,
+                VanillaInventoryWireMaximum,
+                ExtendedInventoryWireMaximum,
+                $"serializer #{displayIndex} shared Amount/MaxAmountOverride bound"));
+
+            candidates.Add(new MemoryPatch(
+                IntPtr.Add(deserializerSites[0], DeserializerMaximumImmediateOffset),
+                VanillaInventoryWireMaximum,
+                ExtendedInventoryWireMaximum,
+                $"deserializer #{displayIndex} Amount bound"));
+
+            candidates.Add(new MemoryPatch(
+                IntPtr.Add(deserializerSites[1], DeserializerMaximumImmediateOffset),
+                VanillaInventoryWireMaximum,
+                ExtendedInventoryWireMaximum,
+                $"deserializer #{displayIndex} MaxAmountOverride bound"));
+        }
+
+        var uniqueAddresses = new HashSet<IntPtr>();
         foreach (MemoryPatch patch in candidates)
         {
+            if (!uniqueAddresses.Add(patch.Address))
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate InventoryBuffer patch address 0x{patch.Address.ToInt64():X} detected. Refusing to patch.");
+            }
+
             int current = Marshal.ReadInt32(patch.Address);
             if (current != patch.OriginalValue)
             {
@@ -373,6 +409,10 @@ public sealed class Plugin : BasePlugin
                     $"Patched InventoryBuffer {patch.Description} at 0x{patch.Address.ToInt64():X}: " +
                     $"{patch.OriginalValue} -> {patch.ReplacementValue}.");
             }
+
+            Log.LogInfo(
+                $"InventoryBuffer wire patch verified across {serializerAnchors.Count} generated serializer implementations " +
+                $"({candidates.Count} bounds total).");
         }
         catch
         {
@@ -462,7 +502,7 @@ public sealed class Plugin : BasePlugin
             throw writeError;
     }
 
-    private unsafe IntPtr FindUniqueExecutablePattern(byte[] pattern, bool[] mask, string description)
+    private unsafe List<IntPtr> FindExecutablePatternMatches(byte[] pattern, bool[] mask)
     {
         if (pattern.Length == 0 || pattern.Length != mask.Length)
             throw new ArgumentException("Pattern and mask must be non-empty and the same length.");
@@ -473,8 +513,7 @@ public sealed class Plugin : BasePlugin
         byte* section;
         GetPeSectionTable(imageBase, out numberOfSections, out section);
 
-        IntPtr found = IntPtr.Zero;
-        int matches = 0;
+        var matches = new List<IntPtr>();
 
         for (int i = 0; i < numberOfSections; i++, section += 40)
         {
@@ -489,21 +528,12 @@ public sealed class Plugin : BasePlugin
             int length = checked((int)virtualSize);
             for (int offset = 0; offset <= length - pattern.Length; offset++)
             {
-                if (!MatchesPattern(start + offset, pattern, mask))
-                    continue;
-
-                matches++;
-                found = (IntPtr)(start + offset);
+                if (MatchesPattern(start + offset, pattern, mask))
+                    matches.Add((IntPtr)(start + offset));
             }
         }
 
-        if (matches == 0)
-            return IntPtr.Zero;
-
-        if (matches != 1)
-            throw new InvalidOperationException($"{description} signature was not unique ({matches} matches). Refusing to patch.");
-
-        return found;
+        return matches;
     }
 
     private static unsafe List<IntPtr> FindPatternMatchesInRange(
