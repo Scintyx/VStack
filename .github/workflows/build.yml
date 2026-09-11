@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  MOD_VERSION: '1.0.0'
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Setup .NET 6
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '6.0.x'
 
@@ -28,34 +31,157 @@ jobs:
       - name: Build
         run: dotnet build src/VStack/VStack.csproj -c Release --no-restore
 
+      - name: Validate release source cleanliness
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # v1.0.0 must not ship any temporary development instrumentation.
+          forbidden_source='InstallWireDiagnostics|RemoveWireDiagnostics|BoundedIntWriterDetour|BoundedIntReaderDetour|InventoryAmountFormatterDetour|CreateInventorySlotDataDetour|VSTACK-V[0-9]|RAW-WRITE|RAW-READ|DiagnosticTraceLimitPerStage'
+          if grep -Eiq "$forbidden_source" src/VStack/Plugin.cs; then
+            echo "Temporary diagnostic/probe code detected in release Plugin.cs." >&2
+            exit 1
+          fi
+
+          if find . -maxdepth 2 -type f \( -iname 'DIAGNOSTIC*' -o -iname 'BURST_TEST*' \) -print -quit | grep -q .; then
+            echo "Temporary diagnostic/test file detected in repository release inputs." >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          source = Path("src/VStack/Plugin.cs").read_text(encoding="utf-8")
+          match = re.search(r'public const string PluginVersion = "([^"]+)";', source)
+          if not match:
+              raise SystemExit("PluginVersion was not found in Plugin.cs")
+          expected = os.environ["MOD_VERSION"]
+          if match.group(1) != expected:
+              raise SystemExit(f"PluginVersion {match.group(1)} does not match MOD_VERSION {expected}")
+          PY
+
       - name: Prepare Thunderstore package
         shell: bash
         run: |
           set -euo pipefail
+
           PKG="$GITHUB_WORKSPACE/dist/VStack"
+          ZIP="$GITHUB_WORKSPACE/dist/VStack_Thunderstore_v${MOD_VERSION}.zip"
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+
+          rm -rf "$PKG" "$ZIP"
           mkdir -p "$PKG/BepInEx/plugins/VStack" "$PKG/Source"
 
           cp src/VStack/bin/Release/net6.0/VStack.dll "$PKG/BepInEx/plugins/VStack/VStack.dll"
           cp src/VStack/Plugin.cs "$PKG/Source/Plugin.cs"
           cp src/VStack/VStack.csproj "$PKG/Source/VStack.csproj"
           printf '%s\n' "$GITHUB_SHA" > "$PKG/Source/BUILD_COMMIT.txt"
+
           cp README.md CHANGELOG.md LICENSE ACKNOWLEDGEMENTS.md SOURCE_REVIEW.md VStack.cfg.example "$PKG/"
           cp thunderstore/icon.png "$PKG/icon.png"
 
-          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
-          sed "s|__REPOSITORY_URL__|${REPO_URL}|g" thunderstore/manifest.template.json > "$PKG/manifest.json"
+          sed \
+            -e "s|__REPOSITORY_URL__|${REPO_URL}|g" \
+            -e "s|__VERSION__|${MOD_VERSION}|g" \
+            thunderstore/manifest.template.json > "$PKG/manifest.json"
 
           cd "$PKG"
-          zip -r "$GITHUB_WORKSPACE/dist/VStack_Thunderstore_v1.0.0.zip" .
+          zip -rq "$ZIP" .
+
+      - name: Validate Thunderstore package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PKG="$GITHUB_WORKSPACE/dist/VStack"
+          ZIP="$GITHUB_WORKSPACE/dist/VStack_Thunderstore_v${MOD_VERSION}.zip"
+
+          required_files=(
+            "manifest.json"
+            "README.md"
+            "CHANGELOG.md"
+            "LICENSE"
+            "ACKNOWLEDGEMENTS.md"
+            "SOURCE_REVIEW.md"
+            "icon.png"
+            "BepInEx/plugins/VStack/VStack.dll"
+            "Source/Plugin.cs"
+            "Source/VStack.csproj"
+            "Source/BUILD_COMMIT.txt"
+          )
+
+          for rel in "${required_files[@]}"; do
+            if [[ ! -s "$PKG/$rel" ]]; then
+              echo "Missing or empty required package file: $rel" >&2
+              exit 1
+            fi
+          done
+
+          # The reviewer-facing source in the package must be byte-for-byte
+          # identical to the source used by this workflow build.
+          cmp -s src/VStack/Plugin.cs "$PKG/Source/Plugin.cs"
+          cmp -s src/VStack/VStack.csproj "$PKG/Source/VStack.csproj"
+
+          if [[ "$(tr -d '\r\n' < "$PKG/Source/BUILD_COMMIT.txt")" != "$GITHUB_SHA" ]]; then
+            echo "BUILD_COMMIT.txt does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          python3 -m json.tool "$PKG/manifest.json" >/dev/null
+
+          # Thunderstore requires a 256x256 PNG icon. Read the PNG IHDR using
+          # only Python's standard library so validation adds no dependency.
+          python3 - "$PKG/icon.png" <<'PY'
+          import struct
+          import sys
+
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              signature = f.read(8)
+              if signature != b"\x89PNG\r\n\x1a\n":
+                  raise SystemExit("icon.png is not a valid PNG file")
+              length = struct.unpack(">I", f.read(4))[0]
+              chunk_type = f.read(4)
+              if chunk_type != b"IHDR" or length < 8:
+                  raise SystemExit("icon.png has no valid IHDR chunk")
+              width, height = struct.unpack(">II", f.read(8))
+              if (width, height) != (256, 256):
+                  raise SystemExit(f"icon.png must be 256x256, got {width}x{height}")
+          PY
+
+          # VStack v1.0.0 is intentionally managed-only. Fail CI if any old
+          # native helper/proxy is accidentally reintroduced into the package.
+          if find "$PKG" -type f \( \
+              -iname 'VStack.Native.dll' -o \
+              -iname 'VStack.ClientUI.Native.dll' -o \
+              -iname 'version.dll' -o \
+              -iname '*MinHook*' \
+            \) -print -quit | grep -q .; then
+            echo "Forbidden native helper/proxy detected in package." >&2
+            exit 1
+          fi
+
+          extra_dll="$(find "$PKG" -type f -iname '*.dll' ! -path "$PKG/BepInEx/plugins/VStack/VStack.dll" -print -quit)"
+          if [[ -n "$extra_dll" ]]; then
+            echo "Unexpected DLL detected in package: $extra_dll" >&2
+            exit 1
+          fi
+
+          unzip -tqq "$ZIP"
+          echo "Thunderstore package validation passed."
 
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v7
         with:
           name: VStack-dll
           path: src/VStack/bin/Release/net6.0/VStack.dll
+          if-no-files-found: error
 
       - name: Upload Thunderstore package artifact
         uses: actions/upload-artifact@v7
         with:
           name: VStack-Thunderstore-v1.0.0
           path: dist/VStack_Thunderstore_v1.0.0.zip
+          if-no-files-found: error
