@@ -202,7 +202,7 @@ public sealed class Plugin : BasePlugin
     private const int SerializerWriterCallOffsetVariantB = 0x53;
     private const int DeserializerMaximumImmediateOffset = 11;
     private const int DeserializerReaderCallOffset = 18;
-    private const int DiagnosticTraceLimitPerStage = 40;
+    private const int DiagnosticTraceLimitPerStage = 80;
 
     // The three generated implementations place their matching deserializers at
     // different relative distances. This local window covers all three while still
@@ -460,10 +460,10 @@ public sealed class Plugin : BasePlugin
             out var readerOriginal);
         _boundedReaderOriginal = readerOriginal;
 
-        Log.LogInfo($"V6 diagnostic hook: bounded InventoryBuffer writer at 0x{_inventoryWriterTarget.ToInt64():X}.");
-        Log.LogInfo($"V6 diagnostic hook: bounded InventoryBuffer reader at 0x{_inventoryReaderTarget.ToInt64():X}.");
+        Log.LogInfo($"V7 diagnostic hook: raw bounded writer at 0x{_inventoryWriterTarget.ToInt64():X}.");
+        Log.LogInfo($"V7 diagnostic hook: raw bounded reader at 0x{_inventoryReaderTarget.ToInt64():X}.");
         Log.LogWarning(
-            "VStack v6 wire tracing is ENABLED. Reproduce one stack above 4095, open inventory, then send LogOutput.log.");
+            "VStack v7 RAW wire tracing is ENABLED. It logs the first bounded reader/writer calls without assuming their values. Reproduce one >4095 stack, open inventory, then send LogOutput.log.");
     }
 
     private void RemoveWireDiagnostics()
@@ -485,16 +485,19 @@ public sealed class Plugin : BasePlugin
         if (original is null)
             return 0;
 
+        int traceNumber = Interlocked.Increment(ref _wireWriteTraceCount);
+        if (traceNumber <= DiagnosticTraceLimitPerStage)
+        {
+            Log.LogWarning(
+                $"VSTACK-V7 RAW-WRITE PRE #{traceNumber}: writer=0x{writer.ToInt64():X}, min={min}, max={max}, value={value}, method=0x{methodInfo.ToInt64():X}.");
+        }
+
         int result = original(writer, min, max, value, methodInfo);
 
-        if (min == 0 && max == ExtendedInventoryWireMaximum && value >= VanillaInventoryWireMaximum)
+        if (traceNumber <= DiagnosticTraceLimitPerStage)
         {
-            int traceNumber = Interlocked.Increment(ref _wireWriteTraceCount);
-            if (traceNumber <= DiagnosticTraceLimitPerStage)
-            {
-                Log.LogWarning(
-                    $"VSTACK-V6 WIRE-WRITE #{traceNumber}: value={value}, min={min}, max={max}, result={result}.");
-            }
+            Log.LogWarning(
+                $"VSTACK-V7 RAW-WRITE POST #{traceNumber}: result={result}.");
         }
 
         return result;
@@ -506,16 +509,19 @@ public sealed class Plugin : BasePlugin
         if (original is null)
             return 0;
 
+        int traceNumber = Interlocked.Increment(ref _wireReadTraceCount);
+        if (traceNumber <= DiagnosticTraceLimitPerStage)
+        {
+            Log.LogWarning(
+                $"VSTACK-V7 RAW-READ PRE #{traceNumber}: reader=0x{reader.ToInt64():X}, min={min}, max={max}, method=0x{methodInfo.ToInt64():X}.");
+        }
+
         int value = original(reader, min, max, methodInfo);
 
-        if (min == 0 && max == ExtendedInventoryWireMaximum && value >= VanillaInventoryWireMaximum)
+        if (traceNumber <= DiagnosticTraceLimitPerStage)
         {
-            int traceNumber = Interlocked.Increment(ref _wireReadTraceCount);
-            if (traceNumber <= DiagnosticTraceLimitPerStage)
-            {
-                Log.LogWarning(
-                    $"VSTACK-V6 WIRE-READ #{traceNumber}: value={value}, min={min}, max={max}.");
-            }
+            Log.LogWarning(
+                $"VSTACK-V7 RAW-READ POST #{traceNumber}: value={value}.");
         }
 
         return value;
