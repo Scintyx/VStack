@@ -21,11 +21,8 @@ The Thunderstore package contains:
 manifest.json
 README.md
 CHANGELOG.md
-LICENSE
-ACKNOWLEDGEMENTS.md
 SOURCE_REVIEW.md
 icon.png
-VStack.cfg.example
 
 BepInEx/plugins/VStack/VStack.dll
 
