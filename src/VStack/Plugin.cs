@@ -156,6 +156,41 @@ public sealed class Plugin : BasePlugin
         false, false, false, false
     };
 
+    // ItemGridSelectionEntry.RefreshData extracts Data.Stacks and calls this
+    // amount-formatting helper before assigning the inventory label text. The call
+    // site is a much safer/native-simple place to observe and override the displayed
+    // stack text than detouring the large CreateInventorySlotData value-type method.
+    //
+    //   psrldq xmm6, 4
+    //   xor    r8d, r8d
+    //   movd   ecx, xmm6      ; Data.Stacks
+    //   mov    dl, 1
+    //   call   <amount formatter>
+    //   mov    rcx, [rsi+A0h]
+    private static readonly byte[] InventoryAmountFormatterCallSitePattern =
+    {
+        0x66, 0x0F, 0x73, 0xDE, 0x04,
+        0x45, 0x33, 0xC0,
+        0x66, 0x0F, 0x7E, 0xF1,
+        0xB2, 0x01,
+        0xE8,
+        0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x8E, 0xA0, 0x00, 0x00, 0x00
+    };
+
+    private static readonly bool[] InventoryAmountFormatterCallSitePatternMask =
+    {
+        true, true, true, true, true,
+        true, true, true,
+        true, true, true, true,
+        true, true,
+        true,
+        false, false, false, false,
+        true, true, true, true, true, true, true
+    };
+
+    private const int InventoryAmountFormatterCallInstructionOffset = 14;
+
     private const int ExpectedInventorySerializerVariantACount = 2;
     private const int ExpectedInventorySerializerVariantBCount = 1;
     private const int ExpectedInventorySerializerImplementations =
@@ -178,9 +213,21 @@ public sealed class Plugin : BasePlugin
     private bool _loggedFirstIntercept;
     private bool _loggedInvalidConfig;
     private readonly List<MemoryPatch> _inventoryWirePatches = new();
+    private INativeDetour? _amountFormatterDetour;
+    private InventoryAmountFormatterDelegate? _amountFormatterOriginal;
+    private InventoryAmountFormatterDelegate? _amountFormatterDelegate;
+    private bool _loggedFormatterAtVanillaCap;
+    private bool _loggedFormatterOverride;
+    private bool _loggedFormatterFailure;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ushort SettingsClampHalfDelegate(float value, float min, float max, IntPtr fieldName);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr InventoryAmountFormatterDelegate(int amount, byte formattingMode);
+
+    [DllImport("GameAssembly.dll", EntryPoint = "il2cpp_string_new_utf16", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr Il2CppStringNewUtf16(IntPtr text, int length);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -251,6 +298,19 @@ public sealed class Plugin : BasePlugin
                 "The stack multiplier hook can still work, but inventory counts above 4095 may remain visually capped. " +
                 $"Details: {ex}");
         }
+
+        // RefreshData sends Data.Stacks through a dedicated amount formatter before
+        // assigning the inventory label. Bypass that formatter only for values above
+        // the vanilla 4095 ceiling so the inventory can show the exact replicated
+        // Int32 count. Values at/below 4095 continue through the original formatter.
+        try
+        {
+            InstallInventoryAmountFormatterHook();
+        }
+        catch (Exception ex)
+        {
+            Log.LogError($"Failed to install inventory amount formatter hook: {ex}");
+        }
     }
 
     public override bool Unload()
@@ -262,6 +322,18 @@ public sealed class Plugin : BasePlugin
         catch (Exception ex)
         {
             Log.LogWarning($"Error while restoring InventoryBuffer wire patch: {ex}");
+        }
+
+        try
+        {
+            _amountFormatterDetour?.Dispose();
+            _amountFormatterDetour = null;
+            _amountFormatterOriginal = null;
+            _amountFormatterDelegate = null;
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"Error while removing inventory amount formatter detour: {ex}");
         }
 
         try
@@ -304,6 +376,136 @@ public sealed class Plugin : BasePlugin
         }
 
         return original(value, min, max, fieldName);
+    }
+
+    private void InstallInventoryAmountFormatterHook()
+    {
+        if (_amountFormatterDetour is not null)
+            return;
+
+        IntPtr target = FindInventoryAmountFormatter();
+        if (target == IntPtr.Zero)
+        {
+            throw new InvalidOperationException(
+                "ItemGridSelectionEntry.RefreshData amount-formatter call site was not found.");
+        }
+
+        InventoryAmountFormatterDelegate detourDelegate = InventoryAmountFormatterDetour;
+        _amountFormatterDelegate = detourDelegate;
+        _amountFormatterDetour = INativeDetour.CreateAndApply<InventoryAmountFormatterDelegate>(
+            target,
+            detourDelegate,
+            out var original);
+        _amountFormatterOriginal = original;
+
+        Log.LogInfo($"Hooked inventory amount formatter at 0x{target.ToInt64():X} for exact counts above 4095.");
+    }
+
+    private IntPtr InventoryAmountFormatterDetour(int amount, byte formattingMode)
+    {
+        InventoryAmountFormatterDelegate? original = _amountFormatterOriginal;
+        if (original is null)
+            return IntPtr.Zero;
+
+        // RefreshData uses formattingMode == 1 for the stack-count label. Other
+        // callers of this shared formatter use mode 0, so leave those unrelated UI
+        // paths completely unchanged.
+        if (formattingMode != 1)
+            return original(amount, formattingMode);
+
+        try
+        {
+            // Seeing exactly 4095 here proves the value is still capped before the
+            // text formatter. Log that once so the next investigation has a
+            // definitive breakpoint without touching the large UI ABI.
+            if (amount == VanillaInventoryWireMaximum)
+            {
+                if (!_loggedFormatterAtVanillaCap)
+                {
+                    _loggedFormatterAtVanillaCap = true;
+                    Log.LogWarning(
+                        "Inventory stack formatter received exactly 4095. " +
+                        "If the real stack is larger, the remaining cap is upstream of text formatting.");
+                }
+
+                return original(amount, formattingMode);
+            }
+
+            if (amount > VanillaInventoryWireMaximum)
+            {
+                if (!_loggedFormatterOverride)
+                {
+                    _loggedFormatterOverride = true;
+                    Log.LogInfo(
+                        $"Inventory stack formatter received {amount}; replacing vanilla formatted text with exact decimal count.");
+                }
+
+                IntPtr exactText = CreateIl2CppString(
+                    amount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                if (exactText != IntPtr.Zero)
+                    return exactText;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Never allow a managed exception to escape back through the native UI
+            // call frame. Fall back to V Rising's original formatter instead.
+            if (!_loggedFormatterFailure)
+            {
+                _loggedFormatterFailure = true;
+                Log.LogError($"Exact inventory-count formatter failed; using vanilla text: {ex}");
+            }
+        }
+
+        return original(amount, formattingMode);
+    }
+
+    private static unsafe IntPtr CreateIl2CppString(string text)
+    {
+        fixed (char* chars = text)
+        {
+            return Il2CppStringNewUtf16((IntPtr)chars, text.Length);
+        }
+    }
+
+    private IntPtr FindInventoryAmountFormatter()
+    {
+        List<IntPtr> callSites = FindExecutablePatternMatches(
+            InventoryAmountFormatterCallSitePattern,
+            InventoryAmountFormatterCallSitePatternMask);
+
+        if (callSites.Count == 0)
+            return IntPtr.Zero;
+
+        if (callSites.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Inventory amount formatter call-site signature was not unique ({callSites.Count} matches). Refusing to hook.");
+        }
+
+        IntPtr callInstruction = IntPtr.Add(callSites[0], InventoryAmountFormatterCallInstructionOffset);
+        if (Marshal.ReadByte(callInstruction) != 0xE8)
+        {
+            throw new InvalidOperationException(
+                $"Expected CALL rel32 at 0x{callInstruction.ToInt64():X}; refusing to resolve formatter target.");
+        }
+
+        int relative = Marshal.ReadInt32(IntPtr.Add(callInstruction, 1));
+        long targetAddress = checked(callInstruction.ToInt64() + 5L + relative);
+        IntPtr target = new IntPtr(targetAddress);
+
+        // Verify the resolved target begins with one of the two prologues generated
+        // for this helper in the supplied client/server builds. This keeps the hook
+        // fail-closed if a game update changes the call target.
+        byte first = Marshal.ReadByte(target, 0);
+        byte second = Marshal.ReadByte(target, 1);
+        if (first != 0x48 || second != 0x89)
+        {
+            throw new InvalidOperationException(
+                $"Resolved inventory amount formatter target 0x{target.ToInt64():X} has an unexpected prologue.");
+        }
+
+        return target;
     }
 
     private float GetMultiplier()
