@@ -192,6 +192,120 @@ public sealed class Plugin : BasePlugin
 
     private const int InventoryAmountFormatterCallInstructionOffset = 14;
 
+    // Active V Rising inventory replication is Burst-compiled. The IL2CPP-generated
+    // GameAssembly serializer copies are fallback/dead paths in the tested build.
+    //
+    // The live Burst server serializers encode InventoryBuffer.Amount and
+    // MaxAmountOverride as two inlined 12-bit values. The matching Burst client
+    // deserializers read those same two fields into a 24-byte InventoryBuffer
+    // element. VStack widens only these validated inventory sites to 31 bits.
+    private const int VanillaInventoryBitWidth = 12;
+    private const int ExtendedInventoryBitWidth = 31;
+
+    // Server Burst clamp shape #1:
+    //   cmp ecx, 0x0FFF
+    //   mov eax, 0x0FFF
+    //   cmovge ecx, eax
+    //   ...
+    private static readonly byte[] BurstServerClampPatternA =
+    {
+        0x81, 0xF9, 0xFF, 0x0F, 0x00, 0x00,
+        0xB8, 0xFF, 0x0F, 0x00, 0x00,
+        0x0F, 0x4D, 0xC8,
+        0x85, 0xC9,
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0x0F, 0x4E, 0xC8
+    };
+
+    // Server Burst clamp shape #2:
+    //   cmp r15d, 0x0FFF
+    //   mov eax, 0x0FFF
+    //   cmovge r15d, eax
+    //   ...
+    private static readonly byte[] BurstServerClampPatternB =
+    {
+        0x41, 0x81, 0xFF, 0xFF, 0x0F, 0x00, 0x00,
+        0xB8, 0xFF, 0x0F, 0x00, 0x00,
+        0x44, 0x0F, 0x4D, 0xF8,
+        0x45, 0x85, 0xFF,
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0x44, 0x0F, 0x4E, 0xF8
+    };
+
+    private static readonly bool[] BurstServerClampPatternAMask = CreateAllTrueMask(BurstServerClampPatternA.Length);
+    private static readonly bool[] BurstServerClampPatternBMask = CreateAllTrueMask(BurstServerClampPatternB.Length);
+
+    // Client Burst first inventory field:
+    //   mov rcx, [rdi]
+    //   mov edx, [rdi+8]
+    //   sub rsp, 20h
+    //   mov r8d, 0Ch
+    //   call <bit reader>
+    //   add [rdi+14h], 0Ch
+    private static readonly byte[] BurstClientFirstReadPattern =
+    {
+        0x48, 0x8B, 0x0F,
+        0x8B, 0x57, 0x08,
+        0x48, 0x83, 0xEC, 0x20,
+        0x41, 0xB8, 0x0C, 0x00, 0x00, 0x00,
+        0xE8, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x20,
+        0x83, 0x47, 0x14, 0x0C
+    };
+
+    private static readonly bool[] BurstClientFirstReadPatternMask =
+    {
+        true, true, true,
+        true, true, true,
+        true, true, true, true,
+        true, true, true, true, true, true,
+        true, false, false, false, false,
+        true, true, true, true,
+        true, true, true, true
+    };
+
+    // Client Burst second inventory field:
+    //   sub rsp, 20h
+    //   mov r8d, 0Ch
+    //   call <bit reader>
+    //   ...
+    //   add r9d, 0Ch
+    //
+    // This signature is inventory-specific in the supplied current Burst DLLs:
+    // exactly six matches (3 ghost layouts x 2 Burst compilation sets).
+    private static readonly byte[] BurstClientSecondReadPattern =
+    {
+        0x48, 0x83, 0xEC, 0x20,
+        0x41, 0xB8, 0x0C, 0x00, 0x00, 0x00,
+        0xE8, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x20,
+        0x44, 0x8B, 0x4F, 0x14,
+        0x41, 0x83, 0xC1, 0x0C,
+        0x44, 0x89, 0x4F, 0x14
+    };
+
+    private static readonly bool[] BurstClientSecondReadPatternMask =
+    {
+        true, true, true, true,
+        true, true, true, true, true, true,
+        true, false, false, false, false,
+        true, true, true, true,
+        true, true, true, true,
+        true, true, true, true,
+        true, true, true, true
+    };
+
+    private static readonly byte[] BurstBitWidthMovEdx12 = { 0xBA, 0x0C, 0x00, 0x00, 0x00 };
+    private static readonly bool[] BurstBitWidthMovEdx12Mask = CreateAllTrueMask(BurstBitWidthMovEdx12.Length);
+
+    private const int ExpectedBurstServerClampMatchesPerShape = 6;
+    private const int ExpectedBurstClientDecoderPairs = 6;
+    private const int BurstClientFirstReadWidthImmediateOffset = 12;
+    private const int BurstClientFirstReadBitPositionImmediateOffset = 28;
+    private const int BurstClientSecondReadWidthImmediateOffset = 6;
+    private const int BurstClientSecondReadBitPositionImmediateOffset = 26;
+    private const int BurstClientFirstReadSearchBack = 0x200;
+
     private const int ExpectedInventorySerializerVariantACount = 2;
     private const int ExpectedInventorySerializerVariantBCount = 1;
     private const int ExpectedInventorySerializerImplementations =
@@ -224,6 +338,9 @@ public sealed class Plugin : BasePlugin
     private bool _loggedFormatterAtVanillaCap;
     private bool _loggedFormatterOverride;
     private bool _loggedFormatterFailure;
+
+    private readonly List<BurstMemoryPatch> _burstWirePatches = new();
+    private BurstPatchRole _burstPatchRole = BurstPatchRole.None;
 
     // Temporary v6 diagnostics. These hook only the small shared bounded-int
     // reader/writer helpers already used by the generated InventoryBuffer wire path.
@@ -309,50 +426,48 @@ public sealed class Plugin : BasePlugin
             Log.LogError($"Failed to install SettingsClamp::Half detour: {ex}");
         }
 
-        // Fix the 4095/4096 visible-count limitation at its actual source: the
-        // generated InventoryBuffer snapshot wire bounds. This remains managed-only;
-        // no custom native DLL or external hooking library is used.
+        // Fix the 4095/4096 visible-count limitation in the active Burst AOT
+        // inventory replication path. The current tested build has three inventory
+        // ghost layouts, duplicated across two Burst compilation sets.
         try
         {
-            InstallInventoryWirePatch();
+            _burstPatchRole = InstallBurstInventoryWirePatch();
             Log.LogInfo(
-                $"InventoryBuffer extended-count wire patch enabled (0..{ExtendedInventoryWireMaximum}). " +
-                "VStack must be installed on both the server and every connecting client.");
+                $"Burst InventoryBuffer extended-count patch enabled as {_burstPatchRole} " +
+                $"({VanillaInventoryBitWidth} -> {ExtendedInventoryBitWidth} bits).");
         }
         catch (Exception ex)
         {
-            RestoreInventoryWirePatch();
+            try
+            {
+                RestoreBurstInventoryWirePatch();
+            }
+            catch (Exception restoreEx)
+            {
+                Log.LogWarning($"Error while rolling back Burst inventory patch: {restoreEx}");
+            }
+
+            _burstPatchRole = BurstPatchRole.None;
             Log.LogError(
-                "Failed to install the InventoryBuffer extended-count wire patch. " +
+                "Failed to install the Burst InventoryBuffer extended-count patch. " +
                 "The stack multiplier hook can still work, but inventory counts above 4095 may remain visually capped. " +
                 $"Details: {ex}");
-        }
-
-        // Temporary v6 wire tracing: observe exactly what reaches the shared
-        // bounded writer on the sending side and what the bounded reader reconstructs
-        // on the receiving side. These are small native helpers and do not touch the
-        // large inventory UI ABI that caused the v3 crash.
-        try
-        {
-            InstallWireDiagnostics();
-        }
-        catch (Exception ex)
-        {
-            RemoveWireDiagnostics();
-            Log.LogError($"Failed to install VStack wire diagnostics: {ex}");
         }
 
         // RefreshData sends Data.Stacks through a dedicated amount formatter before
         // assigning the inventory label. Bypass that formatter only for values above
         // the vanilla 4095 ceiling so the inventory can show the exact replicated
         // Int32 count. Values at/below 4095 continue through the original formatter.
-        try
+        if (_burstPatchRole == BurstPatchRole.Client)
         {
-            InstallInventoryAmountFormatterHook();
-        }
-        catch (Exception ex)
-        {
-            Log.LogError($"Failed to install inventory amount formatter hook: {ex}");
+            try
+            {
+                InstallInventoryAmountFormatterHook();
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"Failed to install inventory amount formatter hook: {ex}");
+            }
         }
     }
 
@@ -360,20 +475,12 @@ public sealed class Plugin : BasePlugin
     {
         try
         {
-            RemoveWireDiagnostics();
+            RestoreBurstInventoryWirePatch();
+            _burstPatchRole = BurstPatchRole.None;
         }
         catch (Exception ex)
         {
-            Log.LogWarning($"Error while removing wire diagnostics: {ex}");
-        }
-
-        try
-        {
-            RestoreInventoryWirePatch();
-        }
-        catch (Exception ex)
-        {
-            Log.LogWarning($"Error while restoring InventoryBuffer wire patch: {ex}");
+            Log.LogWarning($"Error while restoring Burst InventoryBuffer wire patch: {ex}");
         }
 
         try
@@ -428,6 +535,472 @@ public sealed class Plugin : BasePlugin
         }
 
         return original(value, min, max, fieldName);
+    }
+
+    private unsafe BurstPatchRole InstallBurstInventoryWirePatch()
+    {
+        RestoreBurstInventoryWirePatch();
+
+        ProcessModule burstModule = GetBurstGeneratedModule();
+
+        List<IntPtr> serverClampA = FindExecutablePatternMatches(
+            burstModule,
+            BurstServerClampPatternA,
+            BurstServerClampPatternAMask);
+
+        List<IntPtr> serverClampB = FindExecutablePatternMatches(
+            burstModule,
+            BurstServerClampPatternB,
+            BurstServerClampPatternBMask);
+
+        List<IntPtr> clientSecondReads = FindExecutablePatternMatches(
+            burstModule,
+            BurstClientSecondReadPattern,
+            BurstClientSecondReadPatternMask);
+
+        bool looksLikeServer =
+            serverClampA.Count == ExpectedBurstServerClampMatchesPerShape &&
+            serverClampB.Count == ExpectedBurstServerClampMatchesPerShape;
+
+        bool hasNoServerClampSignatures =
+            serverClampA.Count == 0 &&
+            serverClampB.Count == 0;
+
+        bool looksLikeClient =
+            hasNoServerClampSignatures &&
+            clientSecondReads.Count == ExpectedBurstClientDecoderPairs;
+
+        if (looksLikeServer)
+        {
+            InstallBurstServerSerializerPatch(serverClampA, serverClampB);
+            Log.LogInfo(
+                $"Burst server inventory serializer patch verified: " +
+                $"{serverClampA.Count + serverClampB.Count} inventory fields, {_burstWirePatches.Count} immediate edits.");
+            return BurstPatchRole.Server;
+        }
+
+        if (looksLikeClient)
+        {
+            InstallBurstClientDeserializerPatch(clientSecondReads);
+            Log.LogInfo(
+                $"Burst client inventory deserializer patch verified: " +
+                $"{clientSecondReads.Count * 2} inventory fields, {_burstWirePatches.Count} immediate edits.");
+            return BurstPatchRole.Client;
+        }
+
+        throw new InvalidOperationException(
+            $"Unrecognized lib_burst_generated.dll layout. " +
+            $"Server clamp A={serverClampA.Count}, server clamp B={serverClampB.Count}, " +
+            $"client second-read={clientSecondReads.Count}. Refusing to patch.");
+    }
+
+    private void InstallBurstServerSerializerPatch(
+        List<IntPtr> clampShapeA,
+        List<IntPtr> clampShapeB)
+    {
+        var candidates = new List<BurstMemoryPatch>(60);
+
+        foreach (IntPtr clamp in clampShapeA)
+        {
+            AddBurstServerFieldPatch(
+                candidates,
+                clamp,
+                firstMaximumImmediateOffset: 2,
+                secondMaximumImmediateOffset: 7,
+                "shape-A");
+        }
+
+        foreach (IntPtr clamp in clampShapeB)
+        {
+            AddBurstServerFieldPatch(
+                candidates,
+                clamp,
+                firstMaximumImmediateOffset: 3,
+                secondMaximumImmediateOffset: 8,
+                "shape-B");
+        }
+
+        if (candidates.Count != 60)
+        {
+            throw new InvalidOperationException(
+                $"Expected 60 Burst server immediate edits, generated {candidates.Count}. Refusing to patch.");
+        }
+
+        ValidateAndApplyBurstPatches(candidates);
+    }
+
+    private void AddBurstServerFieldPatch(
+        List<BurstMemoryPatch> candidates,
+        IntPtr clamp,
+        int firstMaximumImmediateOffset,
+        int secondMaximumImmediateOffset,
+        string shapeName)
+    {
+        // Each field performs:
+        //   reserve/check N bits
+        //   clamp 0..4095
+        //   write N bits
+        //   advance bit position by N
+        //
+        // All four width uses and both upper-bound immediates must move together.
+        List<IntPtr> preWidths = FindPatternMatchesInRange(
+            IntPtr.Add(clamp, -0x30),
+            0x30,
+            BurstBitWidthMovEdx12,
+            BurstBitWidthMovEdx12Mask);
+
+        if (preWidths.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Burst server {shapeName} field at 0x{clamp.ToInt64():X}: " +
+                $"expected exactly one pre-write 12-bit width, found {preWidths.Count}.");
+        }
+
+        List<IntPtr> postWidths = FindPatternMatchesInRange(
+            clamp,
+            0x70,
+            BurstBitWidthMovEdx12,
+            BurstBitWidthMovEdx12Mask);
+
+        if (postWidths.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Burst server {shapeName} field at 0x{clamp.ToInt64():X}: " +
+                $"expected exactly one writer 12-bit width, found {postWidths.Count}.");
+        }
+
+        IntPtr bitPositionImmediate = FindBurstServerBitPositionImmediate(clamp);
+
+        candidates.Add(BurstMemoryPatch.Int32(
+            IntPtr.Add(preWidths[0], 1),
+            VanillaInventoryBitWidth,
+            ExtendedInventoryBitWidth,
+            $"Burst server {shapeName} pre-write bit width"));
+
+        candidates.Add(BurstMemoryPatch.Int32(
+            IntPtr.Add(clamp, firstMaximumImmediateOffset),
+            VanillaInventoryWireMaximum,
+            ExtendedInventoryWireMaximum,
+            $"Burst server {shapeName} compare maximum"));
+
+        candidates.Add(BurstMemoryPatch.Int32(
+            IntPtr.Add(clamp, secondMaximumImmediateOffset),
+            VanillaInventoryWireMaximum,
+            ExtendedInventoryWireMaximum,
+            $"Burst server {shapeName} clamp maximum"));
+
+        candidates.Add(BurstMemoryPatch.Int32(
+            IntPtr.Add(postWidths[0], 1),
+            VanillaInventoryBitWidth,
+            ExtendedInventoryBitWidth,
+            $"Burst server {shapeName} writer bit width"));
+
+        candidates.Add(BurstMemoryPatch.Byte(
+            bitPositionImmediate,
+            (byte)VanillaInventoryBitWidth,
+            (byte)ExtendedInventoryBitWidth,
+            $"Burst server {shapeName} bit-position advance"));
+    }
+
+    private static IntPtr FindBurstServerBitPositionImmediate(IntPtr clamp)
+    {
+        // Observed generated encodings:
+        //   add dword ptr [r14+18h], 0Ch
+        //   add dword ptr [rsi+18h], 0Ch
+        //   add dword ptr [rdi+18h], 0Ch
+        byte[][] patterns =
+        {
+            new byte[] { 0x41, 0x83, 0x46, 0x18, 0x0C },
+            new byte[] { 0x83, 0x46, 0x18, 0x0C },
+            new byte[] { 0x83, 0x47, 0x18, 0x0C }
+        };
+
+        var immediates = new HashSet<IntPtr>();
+
+        foreach (byte[] pattern in patterns)
+        {
+            bool[] mask = CreateAllTrueMask(pattern.Length);
+            List<IntPtr> matches = FindPatternMatchesInRange(clamp, 0x70, pattern, mask);
+
+            foreach (IntPtr match in matches)
+            {
+                int immediateOffset = pattern.Length - 1;
+                immediates.Add(IntPtr.Add(match, immediateOffset));
+            }
+        }
+
+        if (immediates.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Burst server field at 0x{clamp.ToInt64():X}: " +
+                $"expected exactly one 12-bit bit-position advance, found {immediates.Count}.");
+        }
+
+        foreach (IntPtr immediate in immediates)
+            return immediate;
+
+        throw new InvalidOperationException("Unreachable Burst bit-position lookup state.");
+    }
+
+    private void InstallBurstClientDeserializerPatch(List<IntPtr> secondReads)
+    {
+        var candidates = new List<BurstMemoryPatch>(24);
+
+        secondReads.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
+
+        for (int i = 0; i < secondReads.Count; i++)
+        {
+            IntPtr secondRead = secondReads[i];
+
+            List<IntPtr> firstReads = FindPatternMatchesInRange(
+                IntPtr.Add(secondRead, -BurstClientFirstReadSearchBack),
+                BurstClientFirstReadSearchBack,
+                BurstClientFirstReadPattern,
+                BurstClientFirstReadPatternMask);
+
+            if (firstReads.Count != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Burst client decoder pair #{i + 1}: expected exactly one matching first 12-bit read " +
+                    $"within 0x{BurstClientFirstReadSearchBack:X} bytes, found {firstReads.Count}.");
+            }
+
+            IntPtr firstRead = firstReads[0];
+            long distance = secondRead.ToInt64() - firstRead.ToInt64();
+            if (distance < 0xE0 || distance > 0xF0)
+            {
+                throw new InvalidOperationException(
+                    $"Burst client decoder pair #{i + 1}: unexpected field spacing 0x{distance:X}. Refusing to patch.");
+            }
+
+            candidates.Add(BurstMemoryPatch.Int32(
+                IntPtr.Add(firstRead, BurstClientFirstReadWidthImmediateOffset),
+                VanillaInventoryBitWidth,
+                ExtendedInventoryBitWidth,
+                $"Burst client pair #{i + 1} first-field reader width"));
+
+            candidates.Add(BurstMemoryPatch.Byte(
+                IntPtr.Add(firstRead, BurstClientFirstReadBitPositionImmediateOffset),
+                (byte)VanillaInventoryBitWidth,
+                (byte)ExtendedInventoryBitWidth,
+                $"Burst client pair #{i + 1} first-field bit-position advance"));
+
+            candidates.Add(BurstMemoryPatch.Int32(
+                IntPtr.Add(secondRead, BurstClientSecondReadWidthImmediateOffset),
+                VanillaInventoryBitWidth,
+                ExtendedInventoryBitWidth,
+                $"Burst client pair #{i + 1} second-field reader width"));
+
+            candidates.Add(BurstMemoryPatch.Byte(
+                IntPtr.Add(secondRead, BurstClientSecondReadBitPositionImmediateOffset),
+                (byte)VanillaInventoryBitWidth,
+                (byte)ExtendedInventoryBitWidth,
+                $"Burst client pair #{i + 1} second-field bit-position advance"));
+        }
+
+        if (candidates.Count != 24)
+        {
+            throw new InvalidOperationException(
+                $"Expected 24 Burst client immediate edits, generated {candidates.Count}. Refusing to patch.");
+        }
+
+        ValidateAndApplyBurstPatches(candidates);
+    }
+
+    private void ValidateAndApplyBurstPatches(List<BurstMemoryPatch> candidates)
+    {
+        var uniqueAddresses = new HashSet<IntPtr>();
+
+        foreach (BurstMemoryPatch patch in candidates)
+        {
+            if (!uniqueAddresses.Add(patch.Address))
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate Burst patch address 0x{patch.Address.ToInt64():X} detected. Refusing to patch.");
+            }
+
+            byte[] current = ReadBytes(patch.Address, patch.OriginalBytes.Length);
+            if (!BytesEqual(current, patch.OriginalBytes))
+            {
+                throw new InvalidOperationException(
+                    $"Unexpected bytes at 0x{patch.Address.ToInt64():X} for {patch.Description}. Refusing to patch.");
+            }
+        }
+
+        _burstWirePatches.AddRange(candidates);
+
+        try
+        {
+            foreach (BurstMemoryPatch patch in candidates)
+                WriteProtectedBytes(patch.Address, patch.ReplacementBytes);
+        }
+        catch
+        {
+            RestoreBurstInventoryWirePatch();
+            throw;
+        }
+    }
+
+    private void RestoreBurstInventoryWirePatch()
+    {
+        if (_burstWirePatches.Count == 0)
+            return;
+
+        Exception? firstError = null;
+
+        for (int i = _burstWirePatches.Count - 1; i >= 0; i--)
+        {
+            BurstMemoryPatch patch = _burstWirePatches[i];
+
+            try
+            {
+                byte[] current = ReadBytes(patch.Address, patch.ReplacementBytes.Length);
+
+                if (BytesEqual(current, patch.ReplacementBytes))
+                {
+                    WriteProtectedBytes(patch.Address, patch.OriginalBytes);
+                }
+                else if (!BytesEqual(current, patch.OriginalBytes))
+                {
+                    Log.LogWarning(
+                        $"Not restoring Burst patch '{patch.Description}' at 0x{patch.Address.ToInt64():X}; " +
+                        "current bytes are neither VStack's replacement nor the original bytes.");
+                }
+            }
+            catch (Exception ex)
+            {
+                firstError ??= ex;
+            }
+        }
+
+        if (firstError is null)
+            _burstWirePatches.Clear();
+
+        if (firstError is not null)
+            throw firstError;
+    }
+
+    private static ProcessModule GetBurstGeneratedModule()
+    {
+        foreach (ProcessModule module in Process.GetCurrentProcess().Modules)
+        {
+            if (string.Equals(module.ModuleName, "lib_burst_generated.dll", StringComparison.OrdinalIgnoreCase))
+                return module;
+        }
+
+        throw new InvalidOperationException("lib_burst_generated.dll is not loaded.");
+    }
+
+    private unsafe List<IntPtr> FindExecutablePatternMatches(
+        ProcessModule module,
+        byte[] pattern,
+        bool[] mask)
+    {
+        if (pattern.Length == 0 || pattern.Length != mask.Length)
+            throw new ArgumentException("Pattern and mask must be non-empty and the same length.");
+
+        byte* imageBase = (byte*)module.BaseAddress;
+        ushort numberOfSections;
+        byte* section;
+        GetPeSectionTable(imageBase, out numberOfSections, out section);
+
+        var matches = new List<IntPtr>();
+
+        for (int i = 0; i < numberOfSections; i++, section += 40)
+        {
+            uint virtualSize = *(uint*)(section + 0x08);
+            uint virtualAddress = *(uint*)(section + 0x0C);
+            uint characteristics = *(uint*)(section + 0x24);
+
+            if ((characteristics & ImageScnMemExecute) == 0 || virtualSize < pattern.Length)
+                continue;
+
+            byte* start = imageBase + virtualAddress;
+            int length = checked((int)virtualSize);
+
+            for (int offset = 0; offset <= length - pattern.Length; offset++)
+            {
+                if (MatchesPattern(start + offset, pattern, mask))
+                    matches.Add((IntPtr)(start + offset));
+            }
+        }
+
+        return matches;
+    }
+
+    private static bool[] CreateAllTrueMask(int length)
+    {
+        var mask = new bool[length];
+        for (int i = 0; i < length; i++)
+            mask[i] = true;
+        return mask;
+    }
+
+    private static byte[] ReadBytes(IntPtr address, int length)
+    {
+        var bytes = new byte[length];
+        Marshal.Copy(address, bytes, 0, length);
+        return bytes;
+    }
+
+    private static bool BytesEqual(byte[] left, byte[] right)
+    {
+        if (left.Length != right.Length)
+            return false;
+
+        for (int i = 0; i < left.Length; i++)
+        {
+            if (left[i] != right[i])
+                return false;
+        }
+
+        return true;
+    }
+
+    private static void WriteProtectedBytes(IntPtr address, byte[] bytes)
+    {
+        UIntPtr size = new UIntPtr((uint)bytes.Length);
+
+        if (!VirtualProtect(address, size, PageExecuteReadWrite, out uint oldProtect))
+        {
+            throw new InvalidOperationException(
+                $"VirtualProtect(RWX) failed at 0x{address.ToInt64():X}; Win32 error {Marshal.GetLastWin32Error()}.");
+        }
+
+        Exception? writeError = null;
+
+        try
+        {
+            Marshal.Copy(bytes, 0, address, bytes.Length);
+
+            byte[] verify = ReadBytes(address, bytes.Length);
+            if (!BytesEqual(verify, bytes))
+            {
+                throw new InvalidOperationException(
+                    $"Burst memory verification failed at 0x{address.ToInt64():X}.");
+            }
+
+            if (!FlushInstructionCache(GetCurrentProcess(), address, size))
+            {
+                throw new InvalidOperationException(
+                    $"FlushInstructionCache failed at 0x{address.ToInt64():X}; Win32 error {Marshal.GetLastWin32Error()}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            writeError = ex;
+        }
+        finally
+        {
+            if (!VirtualProtect(address, size, oldProtect, out _))
+            {
+                writeError ??= new InvalidOperationException(
+                    $"VirtualProtect(restore) failed at 0x{address.ToInt64():X}; Win32 error {Marshal.GetLastWin32Error()}.");
+            }
+        }
+
+        if (writeError is not null)
+            throw writeError;
     }
 
     private void InstallWireDiagnostics()
@@ -1140,6 +1713,59 @@ public sealed class Plugin : BasePlugin
         }
 
         return true;
+    }
+
+    private enum BurstPatchRole
+    {
+        None = 0,
+        Client = 1,
+        Server = 2
+    }
+
+    private sealed class BurstMemoryPatch
+    {
+        private BurstMemoryPatch(
+            IntPtr address,
+            byte[] originalBytes,
+            byte[] replacementBytes,
+            string description)
+        {
+            Address = address;
+            OriginalBytes = originalBytes;
+            ReplacementBytes = replacementBytes;
+            Description = description;
+        }
+
+        public IntPtr Address { get; }
+        public byte[] OriginalBytes { get; }
+        public byte[] ReplacementBytes { get; }
+        public string Description { get; }
+
+        public static BurstMemoryPatch Int32(
+            IntPtr address,
+            int originalValue,
+            int replacementValue,
+            string description)
+        {
+            return new BurstMemoryPatch(
+                address,
+                BitConverter.GetBytes(originalValue),
+                BitConverter.GetBytes(replacementValue),
+                description);
+        }
+
+        public static BurstMemoryPatch Byte(
+            IntPtr address,
+            byte originalValue,
+            byte replacementValue,
+            string description)
+        {
+            return new BurstMemoryPatch(
+                address,
+                new[] { originalValue },
+                new[] { replacementValue },
+                description);
+        }
     }
 
     private sealed class MemoryPatch
