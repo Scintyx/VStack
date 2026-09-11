@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
@@ -197,7 +198,11 @@ public sealed class Plugin : BasePlugin
         ExpectedInventorySerializerVariantACount + ExpectedInventorySerializerVariantBCount;
 
     private const int SerializerMaximumImmediateOffset = 7;
+    private const int SerializerWriterCallOffsetVariantA = 0x4F;
+    private const int SerializerWriterCallOffsetVariantB = 0x53;
     private const int DeserializerMaximumImmediateOffset = 11;
+    private const int DeserializerReaderCallOffset = 18;
+    private const int DiagnosticTraceLimitPerStage = 40;
 
     // The three generated implementations place their matching deserializers at
     // different relative distances. This local window covers all three while still
@@ -220,11 +225,35 @@ public sealed class Plugin : BasePlugin
     private bool _loggedFormatterOverride;
     private bool _loggedFormatterFailure;
 
+    // Temporary v6 diagnostics. These hook only the small shared bounded-int
+    // reader/writer helpers already used by the generated InventoryBuffer wire path.
+    // No ItemGridSelectionEntry/CreateInventorySlotData detour is installed.
+    private IntPtr _inventoryWriterTarget;
+    private IntPtr _inventoryReaderTarget;
+    private INativeDetour? _boundedWriterDetour;
+    private INativeDetour? _boundedReaderDetour;
+    private BoundedIntWriterDelegate? _boundedWriterOriginal;
+    private BoundedIntReaderDelegate? _boundedReaderOriginal;
+    private BoundedIntWriterDelegate? _boundedWriterDelegate;
+    private BoundedIntReaderDelegate? _boundedReaderDelegate;
+    private int _wireWriteTraceCount;
+    private int _wireReadTraceCount;
+
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ushort SettingsClampHalfDelegate(float value, float min, float max, IntPtr fieldName);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr InventoryAmountFormatterDelegate(int amount, byte formattingMode);
+
+    // Generated bounded integer writer:
+    //   writer, min, max, value, MethodInfo* -> bits written
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int BoundedIntWriterDelegate(IntPtr writer, int min, int max, int value, IntPtr methodInfo);
+
+    // Generated bounded integer reader:
+    //   reader, min, max, MethodInfo* -> reconstructed value
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int BoundedIntReaderDelegate(IntPtr reader, int min, int max, IntPtr methodInfo);
 
     [DllImport("GameAssembly.dll", EntryPoint = "il2cpp_string_new_utf16", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr Il2CppStringNewUtf16(IntPtr text, int length);
@@ -299,6 +328,20 @@ public sealed class Plugin : BasePlugin
                 $"Details: {ex}");
         }
 
+        // Temporary v6 wire tracing: observe exactly what reaches the shared
+        // bounded writer on the sending side and what the bounded reader reconstructs
+        // on the receiving side. These are small native helpers and do not touch the
+        // large inventory UI ABI that caused the v3 crash.
+        try
+        {
+            InstallWireDiagnostics();
+        }
+        catch (Exception ex)
+        {
+            RemoveWireDiagnostics();
+            Log.LogError($"Failed to install VStack wire diagnostics: {ex}");
+        }
+
         // RefreshData sends Data.Stacks through a dedicated amount formatter before
         // assigning the inventory label. Bypass that formatter only for values above
         // the vanilla 4095 ceiling so the inventory can show the exact replicated
@@ -315,6 +358,15 @@ public sealed class Plugin : BasePlugin
 
     public override bool Unload()
     {
+        try
+        {
+            RemoveWireDiagnostics();
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"Error while removing wire diagnostics: {ex}");
+        }
+
         try
         {
             RestoreInventoryWirePatch();
@@ -376,6 +428,97 @@ public sealed class Plugin : BasePlugin
         }
 
         return original(value, min, max, fieldName);
+    }
+
+    private void InstallWireDiagnostics()
+    {
+        if (_boundedWriterDetour is not null || _boundedReaderDetour is not null)
+            return;
+
+        if (_inventoryWriterTarget == IntPtr.Zero || _inventoryReaderTarget == IntPtr.Zero)
+        {
+            throw new InvalidOperationException(
+                "Inventory wire diagnostic targets were not resolved while validating the wire patch.");
+        }
+
+        _wireWriteTraceCount = 0;
+        _wireReadTraceCount = 0;
+
+        BoundedIntWriterDelegate writerDelegate = BoundedIntWriterDetour;
+        _boundedWriterDelegate = writerDelegate;
+        _boundedWriterDetour = INativeDetour.CreateAndApply<BoundedIntWriterDelegate>(
+            _inventoryWriterTarget,
+            writerDelegate,
+            out var writerOriginal);
+        _boundedWriterOriginal = writerOriginal;
+
+        BoundedIntReaderDelegate readerDelegate = BoundedIntReaderDetour;
+        _boundedReaderDelegate = readerDelegate;
+        _boundedReaderDetour = INativeDetour.CreateAndApply<BoundedIntReaderDelegate>(
+            _inventoryReaderTarget,
+            readerDelegate,
+            out var readerOriginal);
+        _boundedReaderOriginal = readerOriginal;
+
+        Log.LogInfo($"V6 diagnostic hook: bounded InventoryBuffer writer at 0x{_inventoryWriterTarget.ToInt64():X}.");
+        Log.LogInfo($"V6 diagnostic hook: bounded InventoryBuffer reader at 0x{_inventoryReaderTarget.ToInt64():X}.");
+        Log.LogWarning(
+            "VStack v6 wire tracing is ENABLED. Reproduce one stack above 4095, open inventory, then send LogOutput.log.");
+    }
+
+    private void RemoveWireDiagnostics()
+    {
+        _boundedReaderDetour?.Dispose();
+        _boundedReaderDetour = null;
+        _boundedReaderOriginal = null;
+        _boundedReaderDelegate = null;
+
+        _boundedWriterDetour?.Dispose();
+        _boundedWriterDetour = null;
+        _boundedWriterOriginal = null;
+        _boundedWriterDelegate = null;
+    }
+
+    private int BoundedIntWriterDetour(IntPtr writer, int min, int max, int value, IntPtr methodInfo)
+    {
+        BoundedIntWriterDelegate? original = _boundedWriterOriginal;
+        if (original is null)
+            return 0;
+
+        int result = original(writer, min, max, value, methodInfo);
+
+        if (min == 0 && max == ExtendedInventoryWireMaximum && value >= VanillaInventoryWireMaximum)
+        {
+            int traceNumber = Interlocked.Increment(ref _wireWriteTraceCount);
+            if (traceNumber <= DiagnosticTraceLimitPerStage)
+            {
+                Log.LogWarning(
+                    $"VSTACK-V6 WIRE-WRITE #{traceNumber}: value={value}, min={min}, max={max}, result={result}.");
+            }
+        }
+
+        return result;
+    }
+
+    private int BoundedIntReaderDetour(IntPtr reader, int min, int max, IntPtr methodInfo)
+    {
+        BoundedIntReaderDelegate? original = _boundedReaderOriginal;
+        if (original is null)
+            return 0;
+
+        int value = original(reader, min, max, methodInfo);
+
+        if (min == 0 && max == ExtendedInventoryWireMaximum && value >= VanillaInventoryWireMaximum)
+        {
+            int traceNumber = Interlocked.Increment(ref _wireReadTraceCount);
+            if (traceNumber <= DiagnosticTraceLimitPerStage)
+            {
+                Log.LogWarning(
+                    $"VSTACK-V6 WIRE-READ #{traceNumber}: value={value}, min={min}, max={max}.");
+            }
+        }
+
+        return value;
     }
 
     private void InstallInventoryAmountFormatterHook()
@@ -604,6 +747,24 @@ public sealed class Plugin : BasePlugin
 
         serializerAnchors.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
         var candidates = new List<MemoryPatch>(ExpectedInventorySerializerImplementations * 3);
+        var writerTargets = new HashSet<IntPtr>();
+        var readerTargets = new HashSet<IntPtr>();
+
+        // Both serializer shapes call the same bounded-int writer, but the call
+        // instruction is four bytes later in variant B because of register allocation.
+        foreach (IntPtr anchor in serializerAnchorsA)
+        {
+            writerTargets.Add(ResolveRelativeCallTarget(
+                IntPtr.Add(anchor, SerializerWriterCallOffsetVariantA),
+                "InventoryBuffer serializer variant-A bounded writer"));
+        }
+
+        foreach (IntPtr anchor in serializerAnchorsB)
+        {
+            writerTargets.Add(ResolveRelativeCallTarget(
+                IntPtr.Add(anchor, SerializerWriterCallOffsetVariantB),
+                "InventoryBuffer serializer variant-B bounded writer"));
+        }
 
         for (int implementationIndex = 0; implementationIndex < serializerAnchors.Count; implementationIndex++)
         {
@@ -626,6 +787,13 @@ public sealed class Plugin : BasePlugin
             }
 
             deserializerSites.Sort((left, right) => left.ToInt64().CompareTo(right.ToInt64()));
+
+            foreach (IntPtr deserializerSite in deserializerSites)
+            {
+                readerTargets.Add(ResolveRelativeCallTarget(
+                    IntPtr.Add(deserializerSite, DeserializerReaderCallOffset),
+                    $"InventoryBuffer deserializer #{displayIndex} bounded reader"));
+            }
 
             candidates.Add(new MemoryPatch(
                 serializerMaximum,
@@ -664,6 +832,24 @@ public sealed class Plugin : BasePlugin
             }
         }
 
+        if (writerTargets.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected all InventoryBuffer serializers to share one bounded writer target; found {writerTargets.Count}.");
+        }
+
+        if (readerTargets.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected all InventoryBuffer deserializers to share one bounded reader target; found {readerTargets.Count}.");
+        }
+
+        foreach (IntPtr target in writerTargets)
+            _inventoryWriterTarget = target;
+
+        foreach (IntPtr target in readerTargets)
+            _inventoryReaderTarget = target;
+
         // Record all validated targets before the first write so recovery can restore
         // even a write that succeeds but then fails during cache/protection handling.
         _inventoryWirePatches.AddRange(candidates);
@@ -687,6 +873,18 @@ public sealed class Plugin : BasePlugin
             RestoreInventoryWirePatch();
             throw;
         }
+    }
+
+    private static IntPtr ResolveRelativeCallTarget(IntPtr callAddress, string description)
+    {
+        if (Marshal.ReadByte(callAddress) != 0xE8)
+        {
+            throw new InvalidOperationException(
+                $"Expected CALL rel32 for {description} at 0x{callAddress.ToInt64():X}. Refusing to continue.");
+        }
+
+        int displacement = Marshal.ReadInt32(callAddress, 1);
+        return new IntPtr(callAddress.ToInt64() + 5L + displacement);
     }
 
     private void RestoreInventoryWirePatch()
