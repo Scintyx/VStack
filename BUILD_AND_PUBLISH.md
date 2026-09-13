@@ -1,17 +1,19 @@
-# Build and publish VStack
+# Build and publish VStacks
 
 ## Recommended GitHub flow
 
 1. Commit the release source to the public `Scintyx/VStack` repository.
-2. Push to `main`/`master`, push a `v*` tag, or manually run **Build VStack** from the Actions tab.
+2. Push to `main`/`master`, push a `v*` tag, or manually run **Build VStacks** from the Actions tab.
 3. Confirm the `build` job completes successfully.
-4. Download the Actions artifact named `VStack-Thunderstore-v1.0.0`.
-5. Open the generated `VStack_Thunderstore_v1.0.0.zip` and confirm `Source/BUILD_COMMIT.txt` matches the Git commit used for the release.
+4. Download the Actions artifact named `VStacks-Thunderstore-v1.0.0`.
+5. Open the generated `VStacks_Thunderstore_v1.0.0.zip` and confirm `Source/BUILD_COMMIT.txt` matches the Git commit used for the release.
 6. Upload that generated ZIP to Thunderstore.
 
 The workflow replaces `__REPOSITORY_URL__` and `__VERSION__` in the manifest template, then writes the exact Git commit hash into `Source/BUILD_COMMIT.txt`.
 
 ## Runtime vs source
+
+The Thunderstore package is named `VStacks`. Internal runtime names intentionally remain `VStack.dll`, `VStack.cfg`, namespace `VStack`, and GUID `com.originera.vstack`.
 
 BepInEx loads the compiled managed `VStack.dll`; `.cs` files are included for transparency/review and are not loaded directly by BepInEx.
 
@@ -31,7 +33,7 @@ Source/VStack.csproj
 Source/BUILD_COMMIT.txt
 ```
 
-There are no custom native DLLs in VStack. The production v1.0.0 source also contains no temporary diagnostic hooks, raw wire tracing, UI probes, or formatter override.
+There are no custom native DLLs in VStacks. The production v1.0.0 source also contains no temporary diagnostic hooks, raw wire tracing, UI probes, or formatter override.
 
 ## CI validation
 

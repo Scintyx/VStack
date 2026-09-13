@@ -1,12 +1,14 @@
-# VStack
+# VStacks
 
-VStack is an open-source, managed-only **BepInEx 6 IL2CPP** plugin for **V Rising** that increases `InventoryStacksModifier` beyond the normal x3 limitation and fixes the vanilla 4095 inventory replication/display ceiling for extended stacks.
+VStacks is an open-source, managed-only **BepInEx 6 IL2CPP** plugin for **V Rising** that increases `InventoryStacksModifier` beyond the normal x3 limitation and fixes the vanilla 4095 inventory replication/display ceiling for extended stacks.
 
 The stack multiplier is configurable. The default is **x1000**.
 
+> **Package naming:** the Thunderstore package is **VStacks**. The proven internal runtime identifiers remain **VStack** for compatibility, including `VStack.dll`, `VStack.cfg`, the namespace, and plugin GUID.
+
 ## Configuration
 
-On first launch, VStack creates:
+On first launch, the internal VStack plugin creates:
 
 ```text
 BepInEx/config/VStack.cfg
@@ -29,13 +31,13 @@ Multiplier = 1000
 Multiplier = 5000
 ```
 
-VStack accepts positive multiplier values from **0.01 to 65504**. `65504` is the largest finite half-precision value supported by the game setting path used by the stack-setting hook. Invalid, zero, negative, NaN, or infinite values fall back to the default x1000; values above 65504 are safely reduced to 65504.
+VStacks accepts positive multiplier values from **0.01 to 65504**. `65504` is the largest finite half-precision value supported by the game setting path used by the stack-setting hook. Invalid, zero, negative, NaN, or infinite values fall back to the default x1000; values above 65504 are safely reduced to 65504.
 
 Restart V Rising / the server after editing the config file.
 
 ## What VStack changes
 
-VStack changes only:
+VStacks changes only:
 
 ```text
 InventoryStacksModifier
@@ -43,19 +45,19 @@ InventoryStacksModifier
 
 It does **not** uncap or modify unrelated server settings such as drop rates, refinement rates, resource yield, durability, castle settings, or crafting rates.
 
-V Rising's active inventory replication path encodes `InventoryBuffer.Amount` and `MaxAmountOverride` as 12-bit values, which limits the replicated count to 4095. VStack widens only the validated inventory-specific Burst AOT fields to 31 bits, allowing the real stack amount to reach the client inventory UI.
+V Rising's active inventory replication path encodes `InventoryBuffer.Amount` and `MaxAmountOverride` as 12-bit values, which limits the replicated count to 4095. VStacks widens only the validated inventory-specific Burst AOT fields to 31 bits, allowing the real stack amount to reach the client inventory UI.
 
 ## Important: install on server and clients
 
-The extended-count fix changes the `InventoryBuffer` network bit width. The **same VStack build must be installed on the server/host and every connecting client**.
+The extended-count fix changes the `InventoryBuffer` network bit width. The **same VStacks release (which contains `VStack.dll`) must be installed on the server/host and every connecting client**.
 
-Do not mix a VStack-enabled server with vanilla clients, or a VStack-enabled client with a vanilla server, while the extended-count patch is active.
+Do not mix a VStacks-enabled server with vanilla clients, or a VStacks-enabled client with a vanilla server, while the extended-count patch is active.
 
-For Host & Play, install VStack in the BepInEx environment used by the host game. For a dedicated server, install the same VStack build on the dedicated server and on all connecting players.
+For Host & Play, install VStacks in the BepInEx environment used by the host game. For a dedicated server, install the same VStacks release on the dedicated server and on all connecting players.
 
 ## Managed-only implementation
 
-VStack ships only one runtime mod assembly:
+VStacks ships only one runtime mod assembly:
 
 ```text
 BepInEx/plugins/VStack/VStack.dll
@@ -65,7 +67,7 @@ There is no custom `VStack.Native.dll`, no MinHook binary, and no `version.dll` 
 
 The stack-setting hook uses BepInEx's own `BepInEx.Unity.IL2CPP.Hook.INativeDetour.CreateAndApply` API from managed C#.
 
-The extended-count fix is also implemented inside `VStack.dll`. Production signature matching locates the required code in the already-loaded `lib_burst_generated.dll`, validates the expected vanilla bytes and match counts, changes only those verified inventory fields in process memory, and restores them on plugin unload.
+The extended-count fix is implemented inside the internal runtime assembly `VStack.dll`. Production signature matching locates the required code in the already-loaded `lib_burst_generated.dll`, validates the expected vanilla bytes and match counts, changes only those verified inventory fields in process memory, and restores them on plugin unload.
 
 No game DLL is modified on disk.
 
