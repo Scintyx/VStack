@@ -15,7 +15,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "com.originera.vstack";
     public const string PluginName = "VStack";
-    public const string PluginVersion = "1.0.0";
+    public const string PluginVersion = "1.0.1";
     public const float DefaultMultiplier = 1000.0f;
     public const float MinimumMultiplier = 0.01f;
 
@@ -24,6 +24,12 @@ public sealed class Plugin : BasePlugin
     public const float MaximumMultiplier = 65504.0f;
 
     private const string TargetSettingName = "InventoryStacksModifier";
+
+    // Compatibility broker for other OriginEra settings mods that need the same
+    // SettingsClamp::Half hook. VStacks remains the single native-hook owner when
+    // those mods are installed together.
+    private static readonly object ExternalOverrideLock = new();
+    private static ExternalSettingOverride[] _externalSettingOverrides = Array.Empty<ExternalSettingOverride>();
     private const uint ImageScnMemExecute = 0x20000000;
     private const uint PageExecuteReadWrite = 0x40;
 
@@ -258,6 +264,77 @@ public sealed class Plugin : BasePlugin
         }
     }
 
+    /// <summary>
+    /// Registers an additional SettingsClamp::Half override with VStacks.
+    /// Intended for compatible OriginEra mods so multiple plugins do not detour
+    /// the same native function independently.
+    /// </summary>
+    public static bool RegisterSettingOverride(
+        string ownerGuid,
+        string settingName,
+        Func<float> multiplierProvider)
+    {
+        if (string.IsNullOrWhiteSpace(ownerGuid) ||
+            string.IsNullOrWhiteSpace(settingName) ||
+            multiplierProvider is null ||
+            string.Equals(settingName, TargetSettingName, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        lock (ExternalOverrideLock)
+        {
+            var updated = new List<ExternalSettingOverride>(_externalSettingOverrides.Length + 1);
+
+            foreach (ExternalSettingOverride existing in _externalSettingOverrides)
+            {
+                if (string.Equals(existing.OwnerGuid, ownerGuid, StringComparison.Ordinal) &&
+                    string.Equals(existing.SettingName, settingName, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                updated.Add(existing);
+            }
+
+            updated.Add(new ExternalSettingOverride(ownerGuid, settingName, multiplierProvider));
+            _externalSettingOverrides = updated.ToArray();
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Removes every external SettingsClamp override registered by one plugin.
+    /// </summary>
+    public static int UnregisterSettingOverrides(string ownerGuid)
+    {
+        if (string.IsNullOrWhiteSpace(ownerGuid))
+            return 0;
+
+        lock (ExternalOverrideLock)
+        {
+            var updated = new List<ExternalSettingOverride>(_externalSettingOverrides.Length);
+            int removed = 0;
+
+            foreach (ExternalSettingOverride existing in _externalSettingOverrides)
+            {
+                if (string.Equals(existing.OwnerGuid, ownerGuid, StringComparison.Ordinal))
+                {
+                    removed++;
+                    continue;
+                }
+
+                updated.Add(existing);
+            }
+
+            if (removed != 0)
+                _externalSettingOverrides = updated.ToArray();
+
+            return removed;
+        }
+    }
+
     public override bool Unload()
     {
         try
@@ -272,6 +349,9 @@ public sealed class Plugin : BasePlugin
 
         try
         {
+            lock (ExternalOverrideLock)
+                _externalSettingOverrides = Array.Empty<ExternalSettingOverride>();
+
             _detour?.Dispose();
             _detour = null;
             _original = null;
@@ -297,7 +377,7 @@ public sealed class Plugin : BasePlugin
         {
             float multiplier = GetMultiplier();
 
-            // Replace only InventoryStacksModifier. Other settings pass through untouched.
+            // Replace only InventoryStacksModifier for VStacks itself.
             value = multiplier;
             min = 0.0f;
             max = multiplier;
@@ -306,6 +386,58 @@ public sealed class Plugin : BasePlugin
             {
                 _loggedFirstIntercept = true;
                 Log.LogInfo($"{TargetSettingName} intercepted and forced to x{multiplier:0.###}.");
+            }
+        }
+        else
+        {
+            ExternalSettingOverride? external = FindExternalSettingOverride(fieldName);
+
+            if (external is not null)
+            {
+                float multiplier;
+
+                try
+                {
+                    multiplier = external.MultiplierProvider();
+                }
+                catch (Exception ex)
+                {
+                    if (!external.LoggedProviderFailure)
+                    {
+                        external.LoggedProviderFailure = true;
+                        Log.LogWarning(
+                            $"External setting provider '{external.OwnerGuid}' for " +
+                            $"'{external.SettingName}' failed: {ex.Message}. Passing the vanilla value through.");
+                    }
+
+                    return original(value, min, max, fieldName);
+                }
+
+                if (float.IsNaN(multiplier) || float.IsInfinity(multiplier) || multiplier <= 0.0f)
+                {
+                    if (!external.LoggedInvalidValue)
+                    {
+                        external.LoggedInvalidValue = true;
+                        Log.LogWarning(
+                            $"External setting provider '{external.OwnerGuid}' returned invalid multiplier " +
+                            $"'{multiplier}' for '{external.SettingName}'. Passing the vanilla value through.");
+                    }
+
+                    return original(value, min, max, fieldName);
+                }
+
+                multiplier = Math.Min(multiplier, MaximumMultiplier);
+                value = multiplier;
+                min = 0.0f;
+                max = multiplier;
+
+                if (!external.LoggedFirstIntercept)
+                {
+                    external.LoggedFirstIntercept = true;
+                    Log.LogInfo(
+                        $"External setting override [{external.OwnerGuid}] " +
+                        $"{external.SettingName} -> x{multiplier:0.###}.");
+                }
             }
         }
 
@@ -776,6 +908,42 @@ public sealed class Plugin : BasePlugin
 
         if (writeError is not null)
             throw writeError;
+    }
+
+    private static ExternalSettingOverride? FindExternalSettingOverride(IntPtr fieldName)
+    {
+        ExternalSettingOverride[] overrides = _externalSettingOverrides;
+
+        for (int i = 0; i < overrides.Length; i++)
+        {
+            ExternalSettingOverride candidate = overrides[i];
+
+            if (IsIl2CppStringEqual(fieldName, candidate.SettingName))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    private sealed class ExternalSettingOverride
+    {
+        public ExternalSettingOverride(
+            string ownerGuid,
+            string settingName,
+            Func<float> multiplierProvider)
+        {
+            OwnerGuid = ownerGuid;
+            SettingName = settingName;
+            MultiplierProvider = multiplierProvider;
+        }
+
+        public string OwnerGuid { get; }
+        public string SettingName { get; }
+        public Func<float> MultiplierProvider { get; }
+
+        public bool LoggedFirstIntercept { get; set; }
+        public bool LoggedProviderFailure { get; set; }
+        public bool LoggedInvalidValue { get; set; }
     }
 
     private float GetMultiplier()

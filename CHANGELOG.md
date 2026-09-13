@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1
+
+- Added cooperative `SettingsClamp::Half` compatibility for VRates and future compatible OriginEra settings mods.
+- VStacks remains the single native hook owner when compatible mods are installed together.
+- Added a small public registration API for additional named setting overrides.
+- No changes to the proven stack multiplier or Burst 31-bit inventory replication fix.
+
+
 ## 1.0.0
 
 - Thunderstore package name is **VStacks**; internal runtime identifiers remain `VStack` for compatibility.

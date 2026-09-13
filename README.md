@@ -126,3 +126,16 @@ MIT. See `LICENSE`.
 ## Acknowledgements
 
 See `ACKNOWLEDGEMENTS.md`.
+
+
+## Compatibility with VRates
+
+VStacks **1.0.1+** exposes a small cooperative settings-hook API so **VRates** can share the existing
+`SettingsClamp::Half` detour instead of installing a second native detour on the same function.
+
+When both mods are installed:
+
+1. BepInEx loads VStacks first because VRates declares VStacks as a soft dependency.
+2. VStacks owns the single native `SettingsClamp::Half` detour.
+3. VRates registers only `MaterialYieldModifier_Global` and `DropTableModifier_General` with VStacks.
+4. The proven Burst inventory-count patch remains independent and unchanged.

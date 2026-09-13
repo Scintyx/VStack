@@ -41,3 +41,14 @@ No `GameAssembly.dll` or Burst DLL is modified on disk. VStacks changes only loa
 ## Package naming
 
 The public Thunderstore package is named **VStacks**. The internal runtime assembly and compatibility identifiers intentionally remain `VStack.dll`, `VStack.cfg`, namespace `VStack`, and plugin GUID `com.originera.vstack`. This rename does not change runtime behavior or compatibility.
+
+
+## Cooperative settings-hook compatibility
+
+Starting with VStacks 1.0.1, compatible OriginEra plugins may register a named multiplier provider through
+`VStack.Plugin.RegisterSettingOverride(...)`. This avoids multiple plugins independently detouring the same
+`SettingsClamp::Half` native function.
+
+VStacks does not broadly uncap additional settings. An external setting changes only after an installed
+plugin explicitly registers its exact IL2CPP field name. Registrations are removed when the external plugin
+unloads, and VStacks clears all registrations on its own unload.
