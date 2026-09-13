@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  MOD_VERSION: '1.0.0'
+  MOD_VERSION: '1.0.1'
 
 jobs:
   build:
@@ -180,6 +180,6 @@ jobs:
       - name: Upload Thunderstore package artifact
         uses: actions/upload-artifact@v7
         with:
-          name: VStacks-Thunderstore-v1.0.0
-          path: dist/VStacks_Thunderstore_v1.0.0.zip
+          name: VStacks-Thunderstore-v1.0.1
+          path: dist/VStacks_Thunderstore_v1.0.1.zip
           if-no-files-found: error
