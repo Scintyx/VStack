@@ -1,5 +1,5 @@
 {
-  "name": "VStack",
+  "name": "VStacks",
   "version_number": "__VERSION__",
   "website_url": "__REPOSITORY_URL__",
   "description": "Managed-only V Rising stack multiplier mod. Defaults to x1000, configurable through VStack.cfg, with extended inventory counts beyond 4095.",
